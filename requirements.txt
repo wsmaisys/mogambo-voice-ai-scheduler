@@ -1,9 +1,10 @@
-# FastAPI and web framework
-fastapi==0.104.1
+# Web framework
+fastapi==0.95.2
 uvicorn[standard]==0.24.0
 jinja2==3.1.2
 python-multipart==0.0.6
 aiofiles==23.2.1
+starlette==0.27.0
 
 # Google APIs
 google-auth==2.23.4
@@ -11,26 +12,21 @@ google-auth-oauthlib==1.1.0
 google-auth-httplib2==0.1.1
 google-api-python-client==2.108.0
 
-# LangGraph and LangChain
-langgraph==0.0.55
-langchain==0.1.0
-langchain-mistralai==0.0.5
+# LangChain & LangGraph (Pydantic v1-compatible)
+langgraph==0.1.17
+langchain-core==0.2.25
+langchain-mistralai==0.1.10
 
-# Audio processing
+# Audio
 SpeechRecognition==3.10.0
 gTTS==2.4.0
 pydub==0.25.1
-
-# Environment and utilities
-python-dotenv==1.0.0
-pydantic==2.5.0
-typing-extensions==4.8.0
-
-# Additional dependencies for audio on different platforms
-# For Windows: pip install pyaudio
-# For Linux: sudo apt-get install portaudio19-dev python3-pyaudio
-# For macOS: brew install portaudio && pip install pyaudio
-
-# Optional: For better audio handling
+pyaudio==0.2.14
 sounddevice==0.4.6
-numpy==1.24.3
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==1.10.12
+typing-extensions==4.8.0
+pytz==2023.3.post1
+itsdangerous==2.1.2
