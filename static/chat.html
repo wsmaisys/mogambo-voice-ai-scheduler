@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calendar Assistant</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <link href="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/main.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #4a6fa5;
+            --secondary-color: #6c757d;
+        }
+        
+        body {
+            overflow: hidden;
+            background-color: #f8f9fa;
+            height: 100vh;
+        }
+        
+        #app-container {
+            display: flex;
+            height: 100vh;
+        }
+        
+        #sidebar {
+            width: 50%; /* Half screen width */
+            background: white;
+            box-shadow: 2px 0 10px rgba(0,0,0,0.1);
+            z-index: 100;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid #dee2e6;
+        }
+        
+        #calendar-container {
+            flex: 1;
+            padding: 15px;
+            overflow: auto;
+        }
+        
+        #chat-container {
+            width: 50%; /* Half screen width */
+            display: flex;
+            flex-direction: column;
+            background-color: #f0f2f5;
+        }
+        
+        #chat-header {
+            background: white;
+            padding: 15px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        #chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        
+        #chat-input-container {
+            padding: 15px;
+            background: white;
+            border-top: 1px solid #e9ecef;
+        }
+        
+        .message {
+            max-width: 80%;
+            margin-bottom: 15px;
+            animation: fadeIn 0.3s;
+        }
+        
+        .user-message {
+            margin-left: auto;
+            background-color: var(--primary-color);
+            color: white;
+            border-radius: 18px 18px 4px 18px;
+        }
+        
+        .assistant-message {
+            background-color: white;
+            color: #495057;
+            border: 1px solid #e9ecef;
+            border-radius: 18px 18px 18px 4px;
+        }
+        
+        .voice-indicator {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background-color: var(--primary-color);
+            color: white;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .voice-indicator.listening {
+            animation: pulse 1.5s infinite;
+            background-color: #dc3545;
+        }
+        
+        .calendar-event {
+            font-size: 0.85rem;
+            padding: 2px 5px;
+            margin: 2px 0;
+            border-radius: 4px;
+            background-color: #e8f4ff;
+            cursor: pointer;
+        }
+        
+        .logout-btn {
+            background-color: #dc3545;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .logout-btn:hover {
+            background-color: #bb2d3b;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(220, 53, 69, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(220, 53, 69, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(220, 53, 69, 0); }
+        }
+        
+        .user-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background-color: var(--primary-color);
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        
+        /* Make calendar header more compact */
+        .fc-header-toolbar {
+            padding: 10px;
+            margin-bottom: 0.5em !important;
+        }
+        
+        /* Make calendar cells smaller */
+        .fc-daygrid-day-frame {
+            min-height: 50px !important;
+        }
+        
+        .fc-daygrid-day-top {
+            flex-direction: row !important;
+        }
+    </style>
+</head>
+<body>
+    <div id="app-container">
+        <!-- Sidebar with calendar -->
+        <div id="sidebar">
+            <div class="d-flex align-items-center p-3 border-bottom">
+                <div class="user-avatar" id="user-avatar">U</div>
+                <div>
+                    <div id="user-name" class="fw-bold">User</div>
+                    <div id="user-email" class="text-muted small">user@example.com</div>
+                </div>
+                <div class="ms-auto">
+                    <form id="logout-form" action="/logout" method="POST">
+                        <button type="submit" class="logout-btn">
+                            <i class="bi bi-box-arrow-right"></i> Logout
+                        </button>
+                    </form>
+                </div>
+            </div>
+            
+            <div class="p-3 border-bottom">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <h5 class="mb-0">Today's Events</h5>
+                    <button id="refresh-calendar" class="btn btn-sm btn-light">
+                        <i class="bi bi-arrow-repeat"></i> Refresh
+                    </button>
+                </div>
+                <div id="todays-events"></div>
+            </div>
+            
+            <div id="calendar-container">
+                <div id="calendar"></div>
+            </div>
+        </div>
+        
+        <!-- Main chat area -->
+        <div id="chat-container">
+            <div id="chat-header">
+                <h4 class="mb-0">Calendar Assistant</h4>
+                <div class="d-flex align-items-center gap-3">
+                    <span id="connection-status" class="badge bg-success">Connected</span>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="voice-toggle">
+                        <label class="form-check-label" for="voice-toggle">Voice Mode</label>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="chat-messages">
+                <div class="message assistant-message p-3">
+                    <div class="fw-bold mb-1">Calendar Assistant</div>
+                    <div>Hello! How can I help with your calendar today?</div>
+                </div>
+            </div>
+            
+            <div id="chat-input-container" class="d-flex align-items-center">
+                <div class="flex-grow-1 me-2 position-relative">
+                    <input 
+                        type="text" 
+                        id="message-input" 
+                        class="form-control" 
+                        placeholder="Type your message..."
+                        autocomplete="off"
+                    >
+                    <div class="position-absolute top-50 end-0 translate-middle-y me-2">
+                        <div id="voice-indicator" class="voice-indicator">
+                            <i class="bi bi-mic"></i>
+                        </div>
+                    </div>
+                </div>
+                <button id="send-btn" class="btn btn-primary">
+                    <i class="bi bi-send"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/main.min.js"></script>
+    <script>
+    // DOM Elements
+        // Logout on window/tab close for security
+        window.addEventListener('unload', function() {
+            // Use navigator.sendBeacon for reliability
+            navigator.sendBeacon('/logout');
+        });
+        const chatMessages = document.getElementById('chat-messages');
+        const messageInput = document.getElementById('message-input');
+        const sendBtn = document.getElementById('send-btn');
+        const voiceIndicator = document.getElementById('voice-indicator');
+        const voiceToggle = document.getElementById('voice-toggle');
+        const userAvatar = document.getElementById('user-avatar');
+        const userName = document.getElementById('user-name');
+        const userEmail = document.getElementById('user-email');
+        const logoutForm = document.getElementById('logout-form');
+        const todaysEvents = document.getElementById('todays-events');
+        const connectionStatus = document.getElementById('connection-status');
+        const refreshCalendar = document.getElementById('refresh-calendar');
+
+        // State variables
+        let isListening = false;
+        let recognition = null;
+        let calendar = null;
+        let voiceMode = false;
+        let currentUser = null;
+        let calendarEvents = [];
+
+        // Initialize the page
+        document.addEventListener('DOMContentLoaded', async () => {
+            // Load user info
+            await fetchUserInfo();
+            
+            // Initialize calendar
+            initCalendar();
+            
+            // Load today's events
+            loadTodaysEvents();
+            
+            // Set up event listeners
+            setupEventListeners();
+            
+            // Check connection status
+            checkConnection();
+        });
+
+        // Fetch user info from backend
+        async function fetchUserInfo() {
+            try {
+                const response = await fetch('/api/user');
+                if (!response.ok) throw new Error('Failed to fetch user info');
+                
+                const user = await response.json();
+                currentUser = user;
+                
+                // Update UI
+                userAvatar.textContent = user.name ? user.name.charAt(0) : user.email.charAt(0);
+                userName.textContent = user.name || 'User';
+                userEmail.textContent = user.email;
+                
+                if (user.picture) {
+                    userAvatar.style.backgroundImage = `url(${user.picture})`;
+                    userAvatar.style.backgroundSize = 'cover';
+                }
+            } catch (error) {
+                console.error('Error fetching user info:', error);
+            }
+        }
+
+        // Initialize calendar
+        function initCalendar() {
+            const calendarEl = document.getElementById('calendar');
+            calendar = new FullCalendar.Calendar(calendarEl, {
+                initialView: 'dayGridMonth',
+                headerToolbar: {
+                    left: 'prev,next today',
+                    center: 'title',
+                    right: 'dayGridMonth,timeGridWeek,timeGridDay'
+                },
+                height: 'auto', // Make calendar fill available space
+                events: function(fetchInfo, successCallback) {
+                    fetchCalendarEvents(fetchInfo.start, fetchInfo.end)
+                        .then(events => {
+                            calendarEvents = events;
+                            successCallback(events);
+                        })
+                        .catch(error => {
+                            console.error('Error loading calendar events:', error);
+                            successCallback([]);
+                        });
+                },
+                eventClick: function(info) {
+                    // Show event details when clicked
+                    const event = info.event;
+                    let message = `Show details for event: ${event.title}\nStart: ${event.start.toLocaleString()}`;
+                    if (event.end) {
+                        message += `\nEnd: ${event.end.toLocaleString()}`;
+                    }
+                    if (event.extendedProps.description) {
+                        message += `\n\nDescription: ${event.extendedProps.description}`;
+                    }
+                    alert(message);
+                }
+            });
+            
+            calendar.render();
+        }
+
+        // Fetch calendar events from backend
+        async function fetchCalendarEvents(start, end) {
+            try {
+                const timeMin = start.toISOString();
+                const timeMax = end.toISOString();
+                
+                const response = await fetch(`/api/calendar/events?time_min=${timeMin}&time_max=${timeMax}`);
+                if (!response.ok) throw new Error('Failed to fetch calendar events');
+                
+                const data = await response.json();
+                return data.events.map(event => ({
+                    id: event.id,
+                    title: event.summary,
+                    start: event.start,
+                    end: event.end,
+                    extendedProps: {
+                        description: event.description
+                    }
+                }));
+            } catch (error) {
+                console.error('Error fetching calendar events:', error);
+                return [];
+            }
+        }
+
+        // Load today's events
+        async function loadTodaysEvents() {
+            const today = new Date();
+            const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+            const end = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
+            
+            try {
+                const events = await fetchCalendarEvents(start, end);
+                todaysEvents.innerHTML = '';
+                
+                if (events.length === 0) {
+                    todaysEvents.innerHTML = '<div class="text-muted">No events scheduled for today</div>';
+                    return;
+                }
+                
+                events.forEach(event => {
+                    const eventElement = document.createElement('div');
+                    eventElement.className = 'calendar-event';
+                    eventElement.innerHTML = `
+                        <div class="fw-bold">${event.title}</div>
+                        <div class="small text-muted">${formatTime(event.start)} - ${formatTime(event.end)}</div>
+                    `;
+                    eventElement.addEventListener('click', () => {
+                        let message = `Event: ${event.title}\nStart: ${new Date(event.start).toLocaleString()}`;
+                        if (event.end) {
+                            message += `\nEnd: ${new Date(event.end).toLocaleString()}`;
+                        }
+                        if (event.extendedProps.description) {
+                            message += `\n\nDescription: ${event.extendedProps.description}`;
+                        }
+                        alert(message);
+                    });
+                    todaysEvents.appendChild(eventElement);
+                });
+            } catch (error) {
+                todaysEvents.innerHTML = '<div class="text-danger">Failed to load events</div>';
+                console.error('Error loading today\'s events:', error);
+            }
+        }
+
+        // Format time for display
+        function formatTime(dateString) {
+            const date = new Date(dateString);
+            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        // Set up event listeners
+        function setupEventListeners() {
+            // Send message on button click
+            sendBtn.addEventListener('click', sendMessage);
+            
+            // Send message on Enter key
+            messageInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    sendMessage();
+                }
+            });
+            
+            // Voice toggle
+            voiceToggle.addEventListener('change', (e) => {
+                voiceMode = e.target.checked;
+                if (!voiceMode) {
+                    stopVoiceStreaming();
+                }
+            });
+            
+            // Voice indicator click
+            voiceIndicator.addEventListener('click', toggleVoiceInput);
+            
+            // Logout form submission
+            logoutForm.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                try {
+                    // Use fetch to submit the form to handle the response
+                    const response = await fetch('/logout', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                        },
+                        body: new URLSearchParams(new FormData(logoutForm))
+                    });
+                    
+                    if (response.redirected) {
+                        window.location.href = response.url;
+                    }
+                } catch (error) {
+                    console.error('Logout error:', error);
+                    window.location.href = '/logout'; // Fallback
+                }
+            });
+            
+            // Refresh calendar
+            refreshCalendar.addEventListener('click', () => {
+                calendar.refetchEvents();
+                loadTodaysEvents();
+            });
+        }
+
+
+        // --- Voice Recording and File Upload to /api/voice ---
+        let mediaRecorder = null;
+        let audioChunks = [];
+        function toggleVoiceInput() {
+            if (!voiceMode) {
+                addMessage('assistant', 'Please enable voice mode first');
+                return;
+            }
+            if (isListening) {
+                stopVoiceRecording();
+            } else {
+                startVoiceRecording();
+            }
+        }
+
+        function startVoiceRecording() {
+            navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+                let mimeType = 'audio/ogg; codecs=opus';
+                if (!MediaRecorder.isTypeSupported(mimeType)) {
+                    mimeType = 'audio/webm';
+                }
+                mediaRecorder = new MediaRecorder(stream, { mimeType });
+                audioChunks = [];
+                mediaRecorder.ondataavailable = (e) => {
+                    audioChunks.push(e.data);
+                };
+                mediaRecorder.onstop = () => {
+                    stream.getTracks().forEach(track => track.stop());
+                    const audioBlob = new Blob(audioChunks, { type: mimeType });
+                    sendVoiceToBackend(audioBlob);
+                };
+                mediaRecorder.start();
+                isListening = true;
+                voiceIndicator.classList.add('listening');
+                voiceIndicator.innerHTML = '<i class="bi bi-mic-mute"></i>';
+            }).catch(err => {
+                addMessage('assistant', 'Microphone access denied.');
+            });
+        }
+
+        function stopVoiceRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+            isListening = false;
+            voiceIndicator.classList.remove('listening');
+            voiceIndicator.innerHTML = '<i class="bi bi-mic"></i>';
+        }
+
+        async function sendVoiceToBackend(audioBlob) {
+            const formData = new FormData();
+            formData.append('audio', audioBlob, 'voice.ogg');
+            try {
+                const response = await fetch('/api/voice', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                if (data.transcribed_text) {
+                    messageInput.value = data.transcribed_text;
+                    addMessage('assistant', data.transcribed_text);
+                }
+                if (data.response) {
+                    addMessage('assistant', data.response);
+                }
+            } catch (error) {
+                addMessage('assistant', 'Voice recognition error.');
+            }
+        }
+
+        // Send message to assistant
+        async function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message) return;
+            
+            // Add user message to chat
+            addMessage('user', message);
+            messageInput.value = '';
+            
+            try {
+        // --- Voice Recording and File Upload to /api/voice ---
+        let audioChunks = [];
+        function toggleVoiceInput() {
+            if (!voiceMode) {
+                addMessage('assistant', 'Please enable voice mode first');
+                return;
+            }
+            if (isListening) {
+                stopVoiceRecording();
+            } else {
+                startVoiceRecording();
+            }
+        }
+
+        function startVoiceRecording() {
+            navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+                let mimeType = 'audio/ogg; codecs=opus';
+                if (!MediaRecorder.isTypeSupported(mimeType)) {
+                    mimeType = 'audio/webm';
+                }
+                mediaRecorder = new MediaRecorder(stream, { mimeType });
+                audioChunks = [];
+                mediaRecorder.ondataavailable = (e) => {
+                    audioChunks.push(e.data);
+                };
+                mediaRecorder.onstop = () => {
+                    stream.getTracks().forEach(track => track.stop());
+                    const audioBlob = new Blob(audioChunks, { type: mimeType });
+                    sendVoiceToBackend(audioBlob);
+                };
+                mediaRecorder.start();
+                isListening = true;
+                voiceIndicator.classList.add('listening');
+                voiceIndicator.innerHTML = '<i class="bi bi-mic-mute"></i>';
+            }).catch(err => {
+                addMessage('assistant', 'Microphone access denied.');
+            });
+        }
+
+        function stopVoiceRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+            isListening = false;
+            voiceIndicator.classList.remove('listening');
+            voiceIndicator.innerHTML = '<i class="bi bi-mic"></i>';
+        }
+
+        async function sendVoiceToBackend(audioBlob) {
+            const formData = new FormData();
+            formData.append('audio', audioBlob, 'voice.ogg');
+            try {
+                const response = await fetch('/api/voice', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                if (data.transcribed_text) {
+                    messageInput.value = data.transcribed_text;
+                    addMessage('assistant', data.transcribed_text);
+                }
+                if (data.response) {
+                    addMessage('assistant', data.response);
+                }
+            } catch (error) {
+                addMessage('assistant', 'Voice recognition error.');
+            }
+        }
+                // Send to backend
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        message: message,
+                        is_voice: voiceMode
+                    })
+                });
+                
+                if (!response.ok) throw new Error('Failed to get response from assistant');
+                
+                const data = await response.json();
+                addMessage('assistant', data.response);
+                
+                // Refresh calendar after any action
+                calendar.refetchEvents();
+                loadTodaysEvents();
+            } catch (error) {
+                console.error('Error sending message:', error);
+                addMessage('assistant', 'Sorry, I encountered an error. Please try again.');
+            }
+        }
+
+        // Add message to chat UI
+        function addMessage(sender, text) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message p-3 ${sender}-message`;
+            
+            messageDiv.innerHTML = `
+                <div class="fw-bold mb-1">${sender === 'user' ? currentUser.name || 'You' : 'Calendar Assistant'}</div>
+                <div>${text}</div>
+            `;
+            
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        // Check connection status
+        async function checkConnection() {
+            try {
+                const response = await fetch('/health');
+                if (!response.ok) throw new Error('Server not responding');
+                connectionStatus.textContent = 'Connected';
+                connectionStatus.className = 'badge bg-success';
+            } catch (error) {
+                connectionStatus.textContent = 'Disconnected';
+                connectionStatus.className = 'badge bg-danger';
+                setTimeout(checkConnection, 5000); // Retry after 5 seconds
+            }
+        }
+    </script>
+</body>
+</html>
