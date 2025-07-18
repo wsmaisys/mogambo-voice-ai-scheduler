@@ -1,5 +1,12 @@
 # Mogambo Voice AI Scheduler
 
+## 🌐 Deployed Application
+The Mogambo Voice AI Scheduler is currently deployed on the Google Cloud Platform and can be accessed at the following link:
+
+[Deployed App on GCP](https://mogambo-voice-ai-scheduler-124439177573.asia-south2.run.app)
+
+---
+
 ## 🚀 Project Vision
 Mogambo Voice AI Scheduler is a privacy-first, expert-grade calendar assistant. It combines advanced AI, robust voice recognition, and seamless Google Calendar automation to deliver context-aware scheduling and natural conversation—via both text and voice. Mogambo is engineered for reliability, security, and intelligent automation, making it ideal for top professionals and teams.
 
@@ -10,27 +17,19 @@ Mogambo Voice AI Scheduler is a privacy-first, expert-grade calendar assistant. 
 - **Privacy & Security:** Zero data retention, instant logout on window close, and session isolation.
 - **Modern UI:** Responsive, beautiful chat and calendar interface powered by Bootstrap and FullCalendar.
 
-## 🧠 Unique Technical Differentiators
-- **Autonomous AI Agent:** LangGraph, LangChain, and MistralAI for advanced intent analysis and workflow orchestration.
-- **Voice Recognition:** SpeechRecognition, pydub, and gTTS for robust, cross-platform audio handling.
-- **Event Traceability:** Every event selection, update, and deletion is logged in the conversation history for auditability.
-- **Session Security:** Enforced via FastAPI middleware and frontend scripts—no user data is stored after logout.
-- **Expert-Grade Error Handling:** All errors are surfaced with actionable feedback, and the system self-corrects where possible.
-
-## 🏅 Real-World Expert Use Cases
-- **Executive Scheduling:** Manage complex meetings, recurring events, and last-minute changes with voice or text.
-- **Team Collaboration:** Share calendar context, clarify ambiguous requests, and ensure all actions are traceable.
-- **Compliance & Audit:** Every event operation is logged with event ID and summary for full auditability.
-- **Privacy-First Deployments:** Zero data retention and session isolation for regulated industries.
-- **Custom Workflow Extensions:** Add new agent nodes for domain-specific automation (e.g., resource booking, reminders).
+---
 
 ## 🛠️ Architecture Overview
 - **Backend:** FastAPI, LangGraph, LangChain, Google Calendar API, SpeechRecognition, pydub, gTTS
 - **Frontend:** Bootstrap, FullCalendar, custom chat UI, secure session/logout logic
 - **Workflow:** Modular agent nodes for intent detection, event CRUD, voice/text handling, and clarification
 
+---
+
 ## 🗺️ Workflow Graph
 ![Workflow Graph](workflow_graph.png)
+
+The above image illustrates the overall workflow of the Mogambo Voice AI Scheduler application. It provides a visual representation of how the system processes user inputs, detects intents, routes tasks, and generates responses. This diagram serves as a comprehensive guide to understanding the modular and state-driven architecture of the app.
 
 ### Agent Workflow Explanation
 The Mogambo agent uses a modular, state-driven workflow powered by LangGraph. Here’s how the workflow operates:
@@ -61,6 +60,17 @@ The Mogambo agent uses a modular, state-driven workflow powered by LangGraph. He
    All exchanges, event selections, and operations are logged for auditability and compliance.
 
 This workflow ensures robust, context-aware scheduling, expert-level clarification, and seamless voice/text interaction. The modular design allows easy extension for new features and domain-specific automation.
+
+---
+
+## 🧠 Unique Technical Differentiators
+- **Autonomous AI Agent:** LangGraph, LangChain, and MistralAI for advanced intent analysis and workflow orchestration.
+- **Voice Recognition:** SpeechRecognition, pydub, and gTTS for robust, cross-platform audio handling.
+- **Event Traceability:** Every event selection, update, and deletion is logged in the conversation history for auditability.
+- **Session Security:** Enforced via FastAPI middleware and frontend scripts—no user data is stored after logout.
+- **Expert-Grade Error Handling:** All errors are surfaced with actionable feedback, and the system self-corrects where possible.
+
+---
 
 ## 📦 Installation & Setup
 1. **Clone the repository:**
@@ -93,6 +103,8 @@ This workflow ensures robust, context-aware scheduling, expert-level clarificati
 5. **Access the app:**
    - Open [http://localhost:8000](http://localhost:8000) in your browser.
 
+---
+
 ## 🗣️ Usage Guide
 - **Login:** Authenticate via Google OAuth for secure calendar access.
 - **Chat:** Type or speak your requests—"Schedule a meeting tomorrow at 3pm", "Show my events for next week", etc.
@@ -100,17 +112,34 @@ This workflow ensures robust, context-aware scheduling, expert-level clarificati
 - **Event Selection:** For ambiguous update/delete requests, Mogambo will present possible matches with event IDs and summaries for you to select.
 - **Security:** Logout is automatic on window/tab close. No data is retained after session ends.
 
-## 🏆 Expert Innovations
-- **Context-Aware Clarification:** Mogambo never gets stuck—if info is missing, it asks the right question, referencing prior context.
-- **Event ID Traceability:** All event operations are logged with event IDs and summaries for full auditability.
-- **Zero Data Retention:** No user data is stored beyond the session. Privacy is guaranteed.
-- **Cross-Platform Audio:** Handles OGG, WAV, and WebM formats for maximum compatibility.
-- **Modular Agent Design:** Easily extend or customize workflows for advanced use cases.
+---
 
-## 📚 Technologies Used
-- FastAPI, LangGraph, LangChain, MistralAI
-- Google Calendar API, SpeechRecognition, pydub, gTTS
-- Bootstrap, FullCalendar, JavaScript
+## 🔄 CI/CD Pipeline
+The CI/CD pipeline for this application is designed to ensure seamless integration and deployment. The process is as follows:
+
+1. **GitHub Push:**
+   - Any changes pushed to the GitHub repository trigger the CI/CD pipeline.
+
+2. **Automated Testing:**
+   - The pipeline runs unit and integration tests to validate the changes.
+
+3. **Deployment:**
+   - Upon successful testing, the application is automatically deployed to the Google Cloud Platform.
+
+This setup ensures rapid iteration and deployment while maintaining high-quality standards.
+
+---
+
+## 🛠️ Current Status
+- **Testing Phase:**
+  - The application is currently under testing. Login capabilities are restricted to testers only.
+
+- **Production Approval:**
+  - After submission for production approval, the application will undergo a thorough scrutiny process. Deployment to the production environment will be achieved post-approval.
+
+This phased approach ensures that the application meets all quality and security standards before being made available to a broader audience.
+
+---
 
 ## 🧩 File Structure
 ```
@@ -127,18 +156,23 @@ Mogambo-Voice-AI-Scheduler/
 └── readme.md             # This file
 ```
 
+---
+
 ## 🧪 Testing & Validation
 - **Unit & Integration Tests:** Recommended for agent logic and API endpoints.
 - **Manual Testing:** Use the chat UI and calendar to validate all workflows.
 - **Error Handling:** All errors are surfaced in the UI and logs for rapid debugging.
 
-## 💡 Expert Tips
-- **Extend the Agent:** Add new nodes to `agent2.py` for custom workflows (e.g., meeting room booking, reminders).
-- **Audit Conversation History:** Use the logged history for compliance or debugging.
-- **Optimize Audio:** Tune pydub and SpeechRecognition settings for your environment.
-- **Scale Securely:** Deploy with HTTPS and secure environment variables for production.
+---
+
+## 🏆 Expert Innovations
+- **Context-Aware Clarification:** Mogambo never gets stuck—if info is missing, it asks the right question, referencing prior context.
+- **Event ID Traceability:** All event operations are logged with event IDs and summaries for full auditability.
+- **Zero Data Retention:** No user data is stored beyond the session. Privacy is guaranteed.
+- **Cross-Platform Audio:** Handles OGG, WAV, and WebM formats for maximum compatibility.
+- **Modular Agent Design:** Easily extend or customize workflows for advanced use cases.
+
+---
 
 ## 🤝 Credits
 Created by Waseem M Ansari at WSMAISYS Lab, homeground. Inspired by the best in AI, privacy, and productivity.
-
----
