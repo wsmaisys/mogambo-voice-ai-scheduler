@@ -1,8 +1,13 @@
-from fastapi import WebSocket, WebSocketDisconnect
-import speech_recognition as sr
-import asyncio
-from pydub import AudioSegment
-from fastapi import FastAPI, Request, HTTPException, Depends, Form, UploadFile
+# Standard library imports
+import os
+import io
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any, Union
+
+# Third-party imports
+from fastapi import FastAPI, Request, HTTPException, Depends, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -11,68 +16,19 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from pydantic import BaseModel
-import json
-import os
-import secrets
-from typing import Optional, Dict, Any
-import uuid
-from datetime import datetime
-import io
+import speech_recognition as sr
+from pydub import AudioSegment
 
-# Import your agent workflow
-from agent import workflow, AgentState  # Adjust import as needed
+# Local application imports
+from agent import workflow, create_initial_state # Import workflow and create_initial_state from agent2.py
 
-
+# --- FastAPI Application Setup ---
 app = FastAPI(title="Calendar Assistant", version="1.0.0")
-# WebSocket endpoint for live voice recognition and streaming response
-@app.websocket("/ws/voice")
-async def websocket_voice_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    recognizer = sr.Recognizer()
-    audio_data = b""
-    try:
-        while True:
-            data = await websocket.receive_bytes()
-            audio_data += data
-            # For demonstration, process every 2 seconds of audio
-            if len(audio_data) > 32000:  # ~2 seconds at 16kHz mono
-                try:
-                    # Try to process as WAV first
-                    try:
-                        with sr.AudioFile(io.BytesIO(audio_data)) as source:
-                            audio = recognizer.record(source)
-                            try:
-                                text = recognizer.recognize_google(audio)
-                                await websocket.send_json({"transcript": text})
-                            except sr.UnknownValueError:
-                                await websocket.send_json({"transcript": "Sorry, I couldn't understand the audio."})
-                            except sr.RequestError as e:
-                                await websocket.send_json({"transcript": f"Error: {e}"})
-                    except Exception:
-                        # Fallback: try to convert from webm
-                        audio_segment = AudioSegment.from_file(io.BytesIO(audio_data), format="webm")
-                        wav_io = io.BytesIO()
-                        audio_segment.export(wav_io, format="wav")
-                        wav_io.seek(0)
-                        with sr.AudioFile(wav_io) as source:
-                            audio = recognizer.record(source)
-                            try:
-                                text = recognizer.recognize_google(audio)
-                                await websocket.send_json({"transcript": text})
-                            except sr.UnknownValueError:
-                                await websocket.send_json({"transcript": "Sorry, I couldn't understand the audio."})
-                            except sr.RequestError as e:
-                                await websocket.send_json({"transcript": f"Error: {e}"})
-                except Exception as e:
-                    await websocket.send_json({"transcript": f"Audio conversion error: {e}"})
-                audio_data = b""  # Reset buffer
-    except WebSocketDisconnect:
-        pass
 
 # Add session middleware using secret from environment
 app.add_middleware(
     SessionMiddleware,
-    secret_key=os.getenv("SESSION_SECRET_KEY"),
+    secret_key=os.getenv("SESSION_SECRET_KEY", "super-secret-key-please-change-me"), # Fallback for development
     session_cookie="calendaragent_session"
 )
 
@@ -80,7 +36,7 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="static")
 
-# Google OAuth2 Configuration
+# --- Google OAuth2 Configuration ---
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 DEPLOY_ENV = os.getenv("DEPLOY_ENV", "local")
@@ -98,22 +54,28 @@ SCOPES = [
     'https://www.googleapis.com/auth/calendar'
 ]
 
-# In-memory storage for sessions and services
+# In-memory storage for user sessions (for simplicity; consider persistent storage for production)
 user_sessions: Dict[str, Dict[str, Any]] = {}
 
-# Pydantic models for API
+# --- Pydantic Models for API ---
 class ChatMessage(BaseModel):
     message: str
     is_voice: bool = False
 
 class ChatResponse(BaseModel):
-    response: str
+    response: str = ""
     success: bool = True
     error: Optional[str] = None
+    error_message: Optional[str] = None
+    transcribed_text: Optional[str] = None
+    needs_clarification: bool = False # Added for clarity in voice endpoint
 
-# Helper functions
+# --- Helper Functions ---
 def get_google_flow():
     """Create a Google OAuth2 flow."""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise ValueError("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables are not set.")
+    
     flow = Flow.from_client_config(
         {
             "web": {
@@ -147,7 +109,55 @@ def require_auth(request: Request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     return session
 
-# Routes
+# --- WebSocket Endpoint for Live Voice Recognition ---
+@app.websocket("/ws/voice")
+async def websocket_voice_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    recognizer = sr.Recognizer()
+    audio_data_buffer = b"" # Use a buffer to accumulate audio chunks
+    
+    # Define a threshold for processing (e.g., 2 seconds of audio at 16kHz, 16-bit mono)
+    # 16000 samples/sec * 2 bytes/sample * 2 seconds = 64000 bytes
+    PROCESSING_THRESHOLD = 64000 
+
+    try:
+        while True:
+            data = await websocket.receive_bytes()
+            audio_data_buffer += data
+            
+            if len(audio_data_buffer) >= PROCESSING_THRESHOLD:
+                try:
+                    # Attempt to process as WAV first (if client sends WAV directly)
+                    try:
+                        audio_segment = AudioSegment.from_file(io.BytesIO(audio_data_buffer), format="wav")
+                    except Exception:
+                        # Fallback: try to convert from webm (common for browser WebM audio)
+                        audio_segment = AudioSegment.from_file(io.BytesIO(audio_data_buffer), format="webm")
+                    
+                    # Convert to WAV for SpeechRecognition
+                    wav_io = io.BytesIO()
+                    audio_segment.export(wav_io, format="wav")
+                    wav_io.seek(0)
+                    
+                    with sr.AudioFile(wav_io) as source:
+                        audio = recognizer.record(source)
+                        try:
+                            text = recognizer.recognize_google(audio)
+                            await websocket.send_json({"transcript": text, "success": True})
+                        except sr.UnknownValueError:
+                            await websocket.send_json({"transcript": "Sorry, I couldn't understand that.", "success": False})
+                        except sr.RequestError as e:
+                            await websocket.send_json({"transcript": f"Speech recognition error: {e}", "success": False})
+                except Exception as e:
+                    await websocket.send_json({"transcript": f"Audio processing error: {e}", "success": False})
+                
+                audio_data_buffer = b"" # Reset buffer after processing
+    except WebSocketDisconnect:
+        print("WebSocket disconnected.")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+
+# --- Routes ---
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Serve the index page."""
@@ -156,16 +166,22 @@ async def index(request: Request):
 @app.get("/login")
 async def login(request: Request):
     """Initiate Google OAuth login."""
-    flow = get_google_flow()
-    authorization_url, state = flow.authorization_url(
-        access_type='offline',
-        include_granted_scopes='true'
-    )
-    
-    # Store the state in session for verification
-    request.session['oauth_state'] = state
-    
-    return RedirectResponse(authorization_url)
+    try:
+        flow = get_google_flow()
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true'
+        )
+        
+        # Store the state in session for verification
+        request.session['oauth_state'] = state
+        
+        return RedirectResponse(authorization_url)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        print(f"Login initiation error: {e}")
+        raise HTTPException(status_code=500, detail="Could not initiate Google login.")
 
 @app.get("/auth/callback")
 async def callback(request: Request, code: str, state: str):
@@ -194,7 +210,9 @@ async def callback(request: Request, code: str, state: str):
             'credentials': credentials,
             'service': calendar_service,
             'user_info': user_info,
-            'created_at': datetime.now()
+            'created_at': datetime.now(timezone.utc),
+            'conversation_history': [], # Initialize conversation history
+            'last_agent_state': {} # Initialize last agent state
         }
         
         # Store session ID in browser session
@@ -206,7 +224,7 @@ async def callback(request: Request, code: str, state: str):
         
     except Exception as e:
         print(f"OAuth callback error: {e}")
-        raise HTTPException(status_code=400, detail="Authentication failed")
+        raise HTTPException(status_code=400, detail=f"Authentication failed: {e}")
 
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_page(request: Request, session: dict = Depends(require_auth)):
@@ -225,38 +243,99 @@ async def chat_endpoint(
 ):
     """Handle chat messages (both text and voice)."""
     try:
-        # Get the calendar service for this user
         calendar_service = session['service']
         session_id = request.session['session_id']
         
-        # Prepare initial state for the agent
-        initial_state = AgentState(
-            user_input=chat_message.message,
-            is_voice_input=chat_message.is_voice,
+        # Ensure user_session_data is always a dictionary
+        user_session_data = get_current_user_session(request) or {}
+        
+        previous_state = user_session_data.get('last_agent_state')
+        
+        message = chat_message.message
+        is_voice = chat_message.is_voice
+        
+        if is_voice:
+            try:
+                audioBlob = message # Assuming message is raw audio bytes for voice input
+                audio_segment = AudioSegment.from_file(io.BytesIO(audioBlob), format="ogg") # Assuming OGG/Opus
+                wav_io = io.BytesIO()
+                audio_segment.export(wav_io, format="wav")
+                wav_io.seek(0)
+                
+                recognizer = sr.Recognizer()
+                with sr.AudioFile(wav_io) as source:
+                    audio_data = recognizer.record(source)
+                    message = recognizer.recognize_google(audio_data)
+            except sr.UnknownValueError:
+                return ChatResponse(response="", success=False, error="Could not understand audio")
+            except sr.RequestError as e:
+                return ChatResponse(response="", success=False, error=f"Speech recognition error: {e}")
+            except Exception as e:
+                return ChatResponse(response="", success=False, error=f"Error processing audio: {e}")
+        
+        conversation_history = user_session_data.get('conversation_history', [])
+        
+        initial_state = create_initial_state(
+            user_input=message,
             session_id=session_id,
             service=calendar_service,
-            final_response_text="",
-            tool_output="",
-            error_message="",
-            conversation_history=[],
-            pending_clarification=False,
-            collected_info={},
-            missing_required_fields=[],
-            intended_tool="",
-            clarification_question=""
+            is_voice=is_voice,
+            previous_state=previous_state
         )
+        initial_state['conversation_history'] = conversation_history
         
-        # Run the agent workflow
-        result = workflow.invoke(initial_state)
+        # Add user message to history (before workflow invocation)
+        conversation_history.append({
+            'role': 'user',
+            'content': message,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        })
         
-        # Extract the final response
-        response_text = result.get('final_response_text', 'I apologize, but I encountered an issue processing your request.')
+        max_iterations = 3
+        current_iteration = 0
+        response_text = ""
         
-        return ChatResponse(
-            response=response_text,
-            success=True
-        )
+        while current_iteration < max_iterations:
+            try:
+                result = workflow.invoke(initial_state)
+                response_text = result.get('final_response_text', '')
+                
+                if response_text:
+                    conversation_history.append({
+                        'role': 'assistant',
+                        'content': response_text,
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    })
+                
+                if result.get('pending_clarification'):
+                    user_session_data['conversation_history'] = conversation_history
+                    user_session_data['last_agent_state'] = result # Store state for clarification
+                    return ChatResponse(
+                        response=response_text,
+                        success=True,
+                        needs_clarification=True # Indicate clarification needed
+                    )
+                
+                if not result.get('missing_required_fields'):
+                    break
+                
+                current_iteration += 1
+                initial_state = result
+                initial_state['conversation_history'] = conversation_history
+            
+            except Exception as e:
+                print(f"Workflow iteration error: {e}")
+                return ChatResponse(
+                    response="I had trouble processing your request. Please try again.",
+                    success=False,
+                    error=str(e)
+                )
         
+        user_session_data['conversation_history'] = conversation_history
+        user_session_data['last_agent_state'] = result # Store final state
+        
+        return ChatResponse(response=response_text, success=True)
+    
     except Exception as e:
         print(f"Chat endpoint error: {e}")
         return ChatResponse(
@@ -268,65 +347,123 @@ async def chat_endpoint(
 @app.post("/api/voice")
 async def voice_endpoint(
     request: Request,
-    audio: UploadFile = None,
+    audio: UploadFile = Form(...), # Expect audio as form data
     session: dict = Depends(require_auth)
 ):
     """Handle voice input specifically (OGG/Opus)."""
     try:
-        # Get the calendar service for this user
         calendar_service = session['service']
         session_id = request.session['session_id']
-        # Read audio file
+        
         audio_bytes = await audio.read()
-        # Convert OGG/Opus to WAV using pydub
-        from pydub import AudioSegment
-        import io
+        
         audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format="ogg")
         wav_io = io.BytesIO()
         audio_segment.export(wav_io, format="wav")
         wav_io.seek(0)
-        import speech_recognition as sr
+        
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_io) as source:
             audio_data = recognizer.record(source)
             try:
                 transcribed_text = recognizer.recognize_google(audio_data)
             except sr.UnknownValueError:
-                transcribed_text = "Sorry, I couldn't understand the audio."
+                return JSONResponse({
+                    "error_message": "Sorry, I couldn't understand the audio. Please try speaking more clearly.",
+                    "transcribed_text": "",
+                    "success": False
+                })
             except sr.RequestError as e:
-                transcribed_text = f"Error: {e}"
-        # Prepare initial state for voice input
-        initial_state = AgentState(
+                return JSONResponse({
+                    "error_message": f"There was an error with the speech recognition service: {e}",
+                    "transcribed_text": "",
+                    "success": False
+                })
+        
+        if not transcribed_text:
+            return JSONResponse({
+                "error_message": "No voice input was detected. Please try again.",
+                "transcribed_text": "",
+                "success": False
+            })
+
+        user_session_data = get_current_user_session(request) or {}
+        conversation_history = user_session_data.get('conversation_history', [])
+        current_context = user_session_data.get('last_agent_state', {})
+        
+        initial_state = create_initial_state(
             user_input=transcribed_text,
-            is_voice_input=True,
             session_id=session_id,
             service=calendar_service,
-            final_response_text="",
-            tool_output="",
-            error_message="",
-            conversation_history=[],
-            pending_clarification=False,
-            collected_info={},
-            missing_required_fields=[],
-            intended_tool="",
-            clarification_question=""
+            is_voice=True,
+            previous_state=current_context
         )
-        # Run the agent workflow
-        result = workflow.invoke(initial_state)
-        # Extract the final response
-        response_text = result.get('final_response_text', 'I had trouble processing your voice input.')
+        initial_state['conversation_history'] = conversation_history
+        
+        # Add user message to history (before workflow invocation)
+        conversation_history.append({
+            'role': 'user',
+            'content': transcribed_text,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        })
+
+        max_iterations = 3
+        current_iteration = 0
+        response_text = ""
+        
+        while current_iteration < max_iterations:
+            try:
+                result = workflow.invoke(initial_state)
+                response_text = result.get('final_response_text', '')
+                
+                # Update conversation history with assistant response
+                if response_text:
+                    conversation_history.append({
+                        'role': 'assistant',
+                        'content': response_text,
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    })
+                
+                if result.get('pending_clarification'):
+                    user_session_data['conversation_history'] = conversation_history
+                    user_session_data['last_agent_state'] = result # Store state for clarification
+                    return JSONResponse({
+                        "response": response_text,
+                        "transcribed_text": transcribed_text,
+                        "success": True,
+                        "needs_clarification": True
+                    })
+                
+                if not result.get('missing_required_fields'):
+                    break
+                
+                current_iteration += 1
+                initial_state = result
+                initial_state['conversation_history'] = conversation_history
+            
+            except Exception as e:
+                print(f"Workflow iteration error: {e}")
+                return JSONResponse({
+                    "error_message": "I had trouble processing your request. Please try again.",
+                    "transcribed_text": transcribed_text,
+                    "success": False
+                })
+        
+        user_session_data['conversation_history'] = conversation_history
+        user_session_data['last_agent_state'] = result # Store final state
+        
         return JSONResponse({
             "response": response_text,
             "transcribed_text": transcribed_text,
             "success": True
         })
+    
     except Exception as e:
         print(f"Voice endpoint error: {e}")
         return JSONResponse({
-            "response": "I'm sorry, I had trouble processing your voice input. Please try again.",
+            "error_message": "There was an error processing your voice input. Please try again.",
             "transcribed_text": "",
-            "success": False,
-            "error": str(e)
+            "success": False
         })
 
 @app.get("/api/user")
@@ -344,11 +481,9 @@ async def logout(request: Request):
     """Log out the current user."""
     session_id = request.session.get('session_id')
     
-    # Clear server-side session
     if session_id and session_id in user_sessions:
         del user_sessions[session_id]
     
-    # Clear browser session
     request.session.clear()
     
     return RedirectResponse(url="/", status_code=302)
@@ -356,7 +491,7 @@ async def logout(request: Request):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/api/sessions")
 async def get_active_sessions():
@@ -366,7 +501,7 @@ async def get_active_sessions():
         "sessions": list(user_sessions.keys())
     }
 
-# Error handlers
+# --- Error Handlers ---
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """Handle HTTP exceptions."""
@@ -386,11 +521,10 @@ async def general_exception_handler(request: Request, exc: Exception):
         content={"detail": "Internal server error"}
     )
 
-# Cleanup function (optional - you might want to run this periodically)
+# --- Session Cleanup (Optional) ---
 def cleanup_old_sessions():
     """Clean up sessions older than 24 hours."""
-    from datetime import timedelta
-    cutoff_time = datetime.now() - timedelta(hours=24)
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
     
     sessions_to_remove = []
     for session_id, session_data in user_sessions.items():
@@ -402,7 +536,7 @@ def cleanup_old_sessions():
     
     print(f"Cleaned up {len(sessions_to_remove)} old sessions")
 
-# Additional utility endpoints for calendar management
+# --- Calendar Management Utility Endpoints (for direct API access if needed) ---
 @app.get("/api/calendar/events")
 async def get_calendar_events(
     request: Request,
@@ -424,7 +558,6 @@ async def get_calendar_events(
         
         events = events_result.get('items', [])
         
-        # Format events for frontend
         formatted_events = []
         for event in events:
             formatted_events.append({
@@ -483,22 +616,30 @@ async def check_availability(
             "error": str(e)
         }
 
-# Main application startup
+# --- Main Application Startup ---
 if __name__ == "__main__":
     import uvicorn
     
-    # Check for required environment variables
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
         print("Error: GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables are required")
         print("Please set them in your .env file or environment")
         exit(1)
     
+    if not os.getenv("SESSION_SECRET_KEY"):
+        print("Warning: SESSION_SECRET_KEY environment variable is not set. Using a default, which is insecure for production.")
+        print("Please set it in your .env file or environment.")
+
+    if not os.getenv("MISTRAL_API_KEY"):
+        print("Error: MISTRAL_API_KEY environment variable is required for the agent workflow.")
+        print("Please set it in your .env file or environment.")
+        exit(1)
+
     print("Starting Calendar Assistant API...")
     print(f"Google OAuth configured with client ID: {GOOGLE_CLIENT_ID[:20]}...")
     print(f"Redirect URI: {REDIRECT_URI}")
     
     uvicorn.run(
-        "main:app",  # Adjust module name as needed
+        "app:app", # Corrected to 'app:app' as the file is named app.py
         host="0.0.0.0",
         port=8000,
         reload=True,

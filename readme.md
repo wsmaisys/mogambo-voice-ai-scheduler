@@ -144,16 +144,19 @@ This phased approach ensures that the application meets all quality and security
 ## 🧩 File Structure
 ```
 Mogambo-Voice-AI-Scheduler/
-├── app.py                # FastAPI backend & API routes
-├── agent2.py             # Main agent workflow & logic
-├── agent.py              # Legacy agent (reference)
-├── requirements.txt      # Python dependencies
-├── credentials.json      # Google OAuth credentials
-├── static/
-│   ├── chat.html         # Chat UI & calendar frontend
-│   ├── index.html        # Landing page
-│   └── ...               # Icons, assets
-└── readme.md             # This file
+├── .dockerignore             # Docker ignore rules
+├── .gitignore                # Git ignore rules
+├── agent.py                  # Agent logic
+├── app.py                    # Main FastAPI app
+├── Dockerfile                # Docker build config
+├── LICENSE                   # Project license
+├── readme.md                 # Documentation
+├── requirements.txt          # Python dependencies
+├── static/                   # Static HTML assets
+│   ├── chat.html             # Chat interface
+│   ├── favicon.ico           # Site favicon
+│   ├── index.html            # Landing page
+├── workflow_graph.png        # Workflow architecture diagram
 ```
 
 ---
