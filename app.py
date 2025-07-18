@@ -83,7 +83,7 @@ templates = Jinja2Templates(directory="static")
 # Google OAuth2 Configuration
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-REDIRECT_URI = "http://localhost:8000/auth/callback"
+REDIRECT_URI = "https://mogambo-voice-ai-scheduler-124439177573.asia-south2.run.app/callback"
 
 # Scopes for Google Calendar API
 SCOPES = [
