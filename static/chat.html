@@ -106,7 +106,19 @@
             animation: pulse 1.5s infinite;
             background-color: #dc3545;
         }
-        
+
+        .voice-status {
+            position: absolute;
+            top: -25px;
+            left: 0;
+            right: 0;
+            text-align: center;
+            color: #dc3545;
+            font-size: 0.8rem;
+            font-weight: bold;
+            animation: fadeIn 0.3s;
+        }
+
         .calendar-event {
             font-size: 0.85rem;
             padding: 2px 5px;
@@ -250,12 +262,7 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/main.min.js"></script>
     <script>
-    // DOM Elements
-        // Logout on window/tab close for security
-        window.addEventListener('unload', function() {
-            // Use navigator.sendBeacon for reliability
-            navigator.sendBeacon('/logout');
-        });
+        // DOM Elements
         const chatMessages = document.getElementById('chat-messages');
         const messageInput = document.getElementById('message-input');
         const sendBtn = document.getElementById('send-btn');
@@ -276,6 +283,14 @@
         let voiceMode = false;
         let currentUser = null;
         let calendarEvents = [];
+        let mediaRecorder = null;
+        let audioChunks = [];
+
+        // Logout on window/tab close for security
+        window.addEventListener('unload', function() {
+            // Use navigator.sendBeacon for reliability
+            navigator.sendBeacon('/logout');
+        });
 
         // Initialize the page
         document.addEventListener('DOMContentLoaded', async () => {
@@ -444,7 +459,7 @@
             voiceToggle.addEventListener('change', (e) => {
                 voiceMode = e.target.checked;
                 if (!voiceMode) {
-                    stopVoiceStreaming();
+                    stopVoiceRecording();
                 }
             });
             
@@ -480,13 +495,30 @@
             });
         }
 
+        // Voice status management
+        function createVoiceStatusElement() {
+            const voiceStatus = document.createElement('div');
+            voiceStatus.className = 'voice-status';
+            voiceStatus.style.display = 'none';
+            document.querySelector('.flex-grow-1').appendChild(voiceStatus);
+            return voiceStatus;
+        }
 
-        // --- Voice Recording and File Upload to /api/voice ---
-        let mediaRecorder = null;
-        let audioChunks = [];
+        const voiceStatus = createVoiceStatusElement();
+
+        function showVoiceStatus(message) {
+            voiceStatus.textContent = message;
+            voiceStatus.style.display = 'block';
+        }
+
+        function hideVoiceStatus() {
+            voiceStatus.style.display = 'none';
+        }
+
         function toggleVoiceInput() {
             if (!voiceMode) {
-                addMessage('assistant', 'Please enable voice mode first');
+                showVoiceStatus('Please enable voice mode first');
+                setTimeout(hideVoiceStatus, 3000);
                 return;
             }
             if (isListening) {
@@ -498,26 +530,40 @@
 
         function startVoiceRecording() {
             navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+                showVoiceStatus('Listening...');
                 let mimeType = 'audio/ogg; codecs=opus';
                 if (!MediaRecorder.isTypeSupported(mimeType)) {
                     mimeType = 'audio/webm';
                 }
                 mediaRecorder = new MediaRecorder(stream, { mimeType });
                 audioChunks = [];
+                
                 mediaRecorder.ondataavailable = (e) => {
                     audioChunks.push(e.data);
                 };
+                
                 mediaRecorder.onstop = () => {
+                    showVoiceStatus('Processing voice...');
                     stream.getTracks().forEach(track => track.stop());
                     const audioBlob = new Blob(audioChunks, { type: mimeType });
                     sendVoiceToBackend(audioBlob);
                 };
+                
                 mediaRecorder.start();
                 isListening = true;
                 voiceIndicator.classList.add('listening');
                 voiceIndicator.innerHTML = '<i class="bi bi-mic-mute"></i>';
+                
+                // Auto-stop after 10 seconds
+                setTimeout(() => {
+                    if (isListening) {
+                        stopVoiceRecording();
+                    }
+                }, 10000);
             }).catch(err => {
-                addMessage('assistant', 'Microphone access denied.');
+                showVoiceStatus('Microphone access denied');
+                console.error('Microphone access error:', err);
+                setTimeout(hideVoiceStatus, 3000);
             });
         }
 
@@ -533,21 +579,69 @@
         async function sendVoiceToBackend(audioBlob) {
             const formData = new FormData();
             formData.append('audio', audioBlob, 'voice.ogg');
+            
             try {
+                showVoiceStatus('Sending to assistant...');
                 const response = await fetch('/api/voice', {
                     method: 'POST',
                     body: formData
                 });
-                const data = await response.json();
-                if (data.transcribed_text) {
-                    messageInput.value = data.transcribed_text;
-                    addMessage('assistant', data.transcribed_text);
+                
+                if (!response.ok) {
+                    throw new Error('Voice API request failed');
                 }
+                
+                const data = await response.json();
+                
+                if (data.error_message) {
+                    showVoiceStatus(data.error_message);
+                    setTimeout(hideVoiceStatus, 3000);
+                    return;
+                }
+                
+                if (data.transcribed_text) {
+                    addMessage('user', data.transcribed_text);
+                    await sendChatMessage(data.transcribed_text, true);
+                }
+                
+                hideVoiceStatus();
+            } catch (error) {
+                console.error('Voice processing error:', error);
+                showVoiceStatus('Failed to process voice input');
+                setTimeout(hideVoiceStatus, 3000);
+            }
+        }
+
+        async function sendChatMessage(message, isVoice = false) {
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        message: message,
+                        is_voice: isVoice
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Chat API request failed');
+                }
+                
+                const data = await response.json();
+                
                 if (data.response) {
                     addMessage('assistant', data.response);
+                    calendar.refetchEvents();
+                    loadTodaysEvents();
                 }
+                
+                return data;
             } catch (error) {
-                addMessage('assistant', 'Voice recognition error.');
+                console.error('Chat processing error:', error);
+                addMessage('assistant', 'Sorry, I encountered an error. Please try again.');
+                return null;
             }
         }
 
@@ -560,99 +654,8 @@
             addMessage('user', message);
             messageInput.value = '';
             
-            try {
-        // --- Voice Recording and File Upload to /api/voice ---
-        let audioChunks = [];
-        function toggleVoiceInput() {
-            if (!voiceMode) {
-                addMessage('assistant', 'Please enable voice mode first');
-                return;
-            }
-            if (isListening) {
-                stopVoiceRecording();
-            } else {
-                startVoiceRecording();
-            }
-        }
-
-        function startVoiceRecording() {
-            navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-                let mimeType = 'audio/ogg; codecs=opus';
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                    mimeType = 'audio/webm';
-                }
-                mediaRecorder = new MediaRecorder(stream, { mimeType });
-                audioChunks = [];
-                mediaRecorder.ondataavailable = (e) => {
-                    audioChunks.push(e.data);
-                };
-                mediaRecorder.onstop = () => {
-                    stream.getTracks().forEach(track => track.stop());
-                    const audioBlob = new Blob(audioChunks, { type: mimeType });
-                    sendVoiceToBackend(audioBlob);
-                };
-                mediaRecorder.start();
-                isListening = true;
-                voiceIndicator.classList.add('listening');
-                voiceIndicator.innerHTML = '<i class="bi bi-mic-mute"></i>';
-            }).catch(err => {
-                addMessage('assistant', 'Microphone access denied.');
-            });
-        }
-
-        function stopVoiceRecording() {
-            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                mediaRecorder.stop();
-            }
-            isListening = false;
-            voiceIndicator.classList.remove('listening');
-            voiceIndicator.innerHTML = '<i class="bi bi-mic"></i>';
-        }
-
-        async function sendVoiceToBackend(audioBlob) {
-            const formData = new FormData();
-            formData.append('audio', audioBlob, 'voice.ogg');
-            try {
-                const response = await fetch('/api/voice', {
-                    method: 'POST',
-                    body: formData
-                });
-                const data = await response.json();
-                if (data.transcribed_text) {
-                    messageInput.value = data.transcribed_text;
-                    addMessage('assistant', data.transcribed_text);
-                }
-                if (data.response) {
-                    addMessage('assistant', data.response);
-                }
-            } catch (error) {
-                addMessage('assistant', 'Voice recognition error.');
-            }
-        }
-                // Send to backend
-                const response = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        message: message,
-                        is_voice: voiceMode
-                    })
-                });
-                
-                if (!response.ok) throw new Error('Failed to get response from assistant');
-                
-                const data = await response.json();
-                addMessage('assistant', data.response);
-                
-                // Refresh calendar after any action
-                calendar.refetchEvents();
-                loadTodaysEvents();
-            } catch (error) {
-                console.error('Error sending message:', error);
-                addMessage('assistant', 'Sorry, I encountered an error. Please try again.');
-            }
+            // Send message using common function
+            await sendChatMessage(message, false);
         }
 
         // Add message to chat UI
@@ -661,7 +664,7 @@
             messageDiv.className = `message p-3 ${sender}-message`;
             
             messageDiv.innerHTML = `
-                <div class="fw-bold mb-1">${sender === 'user' ? currentUser.name || 'You' : 'Calendar Assistant'}</div>
+                <div class="fw-bold mb-1">${sender === 'user' ? (currentUser ? currentUser.name || 'You' : 'You') : 'Calendar Assistant'}</div>
                 <div>${text}</div>
             `;
             
