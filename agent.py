@@ -533,7 +533,8 @@ def get_structured_response(llm: CachedLLM, messages: List[Dict], response_model
         if json_match:
             content = json_match.group(1)
 
-        structured_response = response_model.model_validate_json(content)
+    # Use Pydantic v1 compatible method for parsing JSON
+        structured_response = response_model.parse_raw(content)
 
         if isinstance(structured_response, IntentAnalysis):
             context_manager.update_context_stack(state, 'intent_analysis', {

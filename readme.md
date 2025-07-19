@@ -75,7 +75,7 @@ This workflow ensures robust, context-aware scheduling, expert-level clarificati
 ## 📦 Installation & Setup
 1. **Clone the repository:**
    ```sh
-   git clone <repo-url>
+   git clone https://github.com/wsmaisys/mogambo-voice-ai-scheduler.git
    cd Mogambo-Voice-AI-Scheduler
    ```
 2. **Install dependencies:**
@@ -94,7 +94,7 @@ This workflow ensures robust, context-aware scheduling, expert-level clarificati
      GOOGLE_CLIENT_SECRET=your-client-secret
      SESSION_SECRET_KEY=your-session-secret
      MISTRAL_API_KEY=your-mistral-apikey
-     REDIRECT_URI=http://localhost:8000/auth/callback
+     REDIRECT_URI=http://localhost:8000/auth/callback (Testing Version)
      ```
 4. **Run the server:**
    ```sh
