@@ -42,7 +42,7 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 DEPLOY_ENV = os.getenv("DEPLOY_ENV", "local")
 
 if DEPLOY_ENV == "production":
-    REDIRECT_URI = "https://mogambo-voice-ai-scheduler-124439177573.asia-south2.run.app/auth/callback"
+    REDIRECT_URI = "https://mogambo-calendar-assistant.onrender.com/auth/callback"
 else:
     REDIRECT_URI = "http://localhost:8000/auth/callback"
 
