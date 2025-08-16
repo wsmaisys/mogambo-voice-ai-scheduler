@@ -3,7 +3,7 @@
 ## 🌐 Deployed Application
 The Mogambo Voice AI Scheduler is currently deployed on the Google Cloud Platform and can be accessed at the following link:
 
-[Deployed App on GCP](https://mogambo-voice-ai-scheduler-124439177573.asia-south2.run.app)
+[Deployed App](https://mogambo-calendar-assistant.onrender.com/)
 
 ---
 
