@@ -2,11 +2,11 @@
 import os
 import re
 import json
+import logging
 import threading
 from datetime import datetime, timedelta, time
 from enum import Enum
-from functools import lru_cache
-from typing import Dict, List, Optional, TypedDict, Union, Any, Tuple
+from typing import Dict, List, Optional, TypedDict, Any, Tuple
 from collections import Counter
 
 # Third-party imports
@@ -16,15 +16,12 @@ from pydantic import BaseModel, Field, ValidationError
 from langgraph.graph import StateGraph, END, START
 from langchain_mistralai import ChatMistralAI
 from dotenv import load_dotenv
+from logging_config import configure_logging
 
-# Voice-related imports (used by app.py for TTS, but included here for completeness if agent were standalone)
-import speech_recognition as sr
-from pydub.playback import play
-from gtts import gTTS
-from pydub import AudioSegment # Used for audio manipulation, not direct playback here
-
-# Load environment variables for agent (redundant if app.py loads, but good for standalone testing)
+# Load environment variables here too so the agent can be imported or tested directly.
 load_dotenv()
+configure_logging()
+logger = logging.getLogger(__name__)
 
 # --- Type Definitions ---
 class AgentState(TypedDict, total=False):
@@ -55,7 +52,6 @@ class AgentState(TypedDict, total=False):
     event_context: Dict[str, Any]
     clarification_context: Dict[str, Any]
     user_preferences: Dict[str, Any]
-    audio_file: str
     previous_collected_info: Dict[str, Any] # For tracking changes
 
 
@@ -63,9 +59,10 @@ class AgentState(TypedDict, total=False):
 class GlobalCache:
     """Thread-safe global cache for optimizing performance and managing state across sessions."""
     _instance: Optional['GlobalCache'] = None
-    _cache: Dict[str, Tuple[Any, datetime]] = {}
+    _cache: Dict[str, Tuple[Any, datetime, timedelta]] = {}
     _lock = threading.Lock()
-    MAX_CACHE_AGE = timedelta(minutes=5)
+    DEFAULT_CACHE_AGE = timedelta(minutes=5)
+    SESSION_CACHE_AGE = timedelta(hours=24)
 
     @classmethod
     def instance(cls) -> 'GlobalCache':
@@ -83,17 +80,32 @@ class GlobalCache:
         """
         with self._lock:
             if key in self._cache:
-                value, timestamp = self._cache[key]
-                if datetime.now() - timestamp < self.MAX_CACHE_AGE:
+                value, timestamp, max_age = self._cache[key]
+                if datetime.now() - timestamp < max_age:
                     return value
                 else:
                     del self._cache[key]  # Expired entry
             return None
 
-    def set(self, key: str, value: Any) -> None:
+    def set(self, key: str, value: Any, max_age: Optional[timedelta] = None) -> None:
         """Stores a value in the cache with the current timestamp."""
         with self._lock:
-            self._cache[key] = (value, datetime.now())
+            ttl = max_age or self.DEFAULT_CACHE_AGE
+            self._cache[key] = (value, datetime.now(), ttl)
+            self._cleanup()
+
+    def set_session(self, key: str, value: Any) -> None:
+        """Stores a user session with a longer session-oriented TTL."""
+        self.set(key, value, self.SESSION_CACHE_AGE)
+
+    def delete(self, key: str) -> None:
+        """Deletes a cache entry if it exists."""
+        with self._lock:
+            self._cache.pop(key, None)
+
+    def cleanup_expired(self) -> None:
+        """Removes expired entries without invalidating active sessions."""
+        with self._lock:
             self._cleanup()
 
     def invalidate_pattern(self, pattern: str) -> None:
@@ -109,10 +121,7 @@ class GlobalCache:
     def _cleanup(self) -> None:
         """Removes expired cache entries. Called automatically on `set`."""
         now = datetime.now()
-        expired_keys = [
-            k for k, (_, t) in self._cache.items()
-            if now - t > self.MAX_CACHE_AGE
-        ]
+        expired_keys = [k for k, (_, t, max_age) in self._cache.items() if now - t > max_age]
         for k in expired_keys:
             del self._cache[k]
 
@@ -141,10 +150,8 @@ class CachedLLM:
         cache_key = f"llm_{hash(json.dumps(messages, sort_keys=True))}"
         cached_response = self.cache.get(cache_key)
         if cached_response:
-            # print(f"DEBUG: Cache hit for LLM with key: {cache_key}")
             return cached_response
 
-        # print(f"DEBUG: Cache miss for LLM with key: {cache_key}. Invoking LLM...")
         response = self.llm.invoke(messages)
         self.cache.set(cache_key, response)
         return response
@@ -277,13 +284,14 @@ def extract_time_info(text: str) -> Dict[str, Any]:
 
     return info
 
-def find_events_by_summary_and_date(service: Any, calendar_id: str, summary: str, date: str) -> List[Dict]:
+def find_events_by_summary_and_date(service: Any, calendar_id: str, summary: str, date_str: str) -> List[Dict]:
     """
     Finds events by fuzzy matching summary and date within a specified calendar.
     """
     try:
-        start_time = f"{date}T00:00:00Z"
-        end_time = f"{date}T23:59:59Z"
+        # Convert date string to ISO format for the full day
+        start_time = f"{date_str}T00:00:00+05:30"
+        end_time = f"{date_str}T23:59:59+05:30"
 
         events_result = service.events().list(
             calendarId=calendar_id,
@@ -293,86 +301,94 @@ def find_events_by_summary_and_date(service: Any, calendar_id: str, summary: str
             orderBy='startTime'
         ).execute()
         events = events_result.get('items', [])
-
+        
         matches = []
         for event in events:
             event_summary = event.get('summary', '')
             ratio = fuzz.ratio(summary.lower(), event_summary.lower())
-            if ratio > 80:  # Adjustable threshold for fuzzy matching
+            if ratio > 70:  # Slightly more lenient threshold
                 matches.append(event)
+                logger.debug("event summary matched", extra={"summary": event_summary, "match_ratio": ratio})
         return matches
     except Exception as e:
-        print(f"Error finding events by summary and date: {e}")
+        logger.exception("event lookup by summary/date failed")
         return []
 
-def parse_datetime_flexible(date_str: str) -> str:
+def parse_datetime_flexible(date_str: str, relative_to: Optional[datetime] = None) -> str:
     """
-    Parses flexible date/time input (e.g., "today 3pm", "tomorrow morning")
-    and returns an ISO 8601 formatted string suitable for Google Calendar API.
-    Defaults to 9 AM if no time is specified.
+    Simple and direct datetime parser that handles common cases.
+    Returns an ISO 8601 formatted string suitable for Google Calendar API.
     """
     try:
-        base_date: datetime.date
-        now = datetime.now(pytz.timezone('Asia/Kolkata'))
+        tz = pytz.timezone('Asia/Kolkata')
+        now = relative_to if relative_to else datetime.now(tz)
+        today = now.date()
+        tomorrow = (now + timedelta(days=1)).date()
 
-        if "today" in date_str.lower():
-            base_date = now.date()
-        elif "tomorrow" in date_str.lower():
-            base_date = (now + timedelta(days=1)).date()
-        elif "next week" in date_str.lower():
-            base_date = (now + timedelta(weeks=1)).date()
+        # Default time settings
+        hour = 9
+        minute = 0
+
+        # Extract date
+        if "tomorrow" in date_str.lower():
+            target_date = tomorrow
+        elif "today" in date_str.lower():
+            target_date = today
         else:
-            # Try to parse as a specific date format
-            parsed = False
-            for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%B %d, %Y", "%b %d, %Y"]:
-                try:
-                    base_date = datetime.strptime(date_str.split(' at ')[0].strip(), fmt).date()
-                    parsed = True
-                    break
-                except ValueError:
-                    continue
-            if not parsed:
-                base_date = now.date() # Default to today if date parsing fails
+            # Try to parse explicit date
+            try:
+                # First try common formats
+                for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%B %d, %Y", "%b %d", "%d %B"]:
+                    try:
+                        parsed_date = datetime.strptime(date_str.split(' at ')[0].strip(), fmt)
+                        target_date = parsed_date.date()
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    # If no format matches, default to today
+                    target_date = today
+            except Exception:
+                target_date = today
 
-        # Extract time from string
-        time_match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?', date_str)
-        if not time_match:
-            time_match = re.search(r'(\d{1,2})\s*(AM|PM|am|pm)', date_str) # e.g., "3 PM"
-
-        hour, minute = 9, 0 # Default time
-        if time_match:
-            if len(time_match.groups()) == 3: # Format like HH:MM AM/PM
-                h_str, m_str, ampm = time_match.groups()
-                hour = int(h_str)
-                minute = int(m_str)
-            else: # Format like HH AM/PM
-                h_str, ampm = time_match.groups()
-                hour = int(h_str)
-                minute = 0
-
-            if ampm and ampm.upper() == 'PM' and hour != 12:
-                hour += 12
-            elif ampm and ampm.upper() == 'AM' and hour == 12:
-                hour = 0
-
-        # Handle relative time references like "morning", "afternoon", "evening"
-        if "morning" in date_str.lower() and not time_match:
-            hour, minute = 9, 0
-        elif "afternoon" in date_str.lower() and not time_match:
-            hour, minute = 14, 0
-        elif "evening" in date_str.lower() and not time_match:
-            hour, minute = 18, 0
+        # Extract time
+        if ":" in date_str:  # HH:MM format
+            time_match = re.search(r'(\d{1,2}):(\d{2})\s*(am|pm)?', date_str.lower())
+            if time_match:
+                hour = int(time_match.group(1))
+                minute = int(time_match.group(2))
+                ampm = time_match.group(3)
+                if ampm == 'pm' and hour != 12:
+                    hour += 12
+                elif ampm == 'am' and hour == 12:
+                    hour = 0
+        else:  # Simple hour format or time of day
+            hour_match = re.search(r'(\d{1,2})\s*(am|pm)', date_str.lower())
+            if hour_match:
+                hour = int(hour_match.group(1))
+                if hour_match.group(2) == 'pm' and hour != 12:
+                    hour += 12
+                elif hour_match.group(2) == 'am' and hour == 12:
+                    hour = 0
+            else:
+                # Time of day references
+                if "morning" in date_str.lower():
+                    hour = 9
+                elif "afternoon" in date_str.lower():
+                    hour = 14
+                elif "evening" in date_str.lower():
+                    hour = 18
+                elif "night" in date_str.lower():
+                    hour = 20
 
         # Combine date and time
-        dt_obj = datetime.combine(base_date, time(hour, minute, 0))
-        # Localize to Asia/Kolkata and then convert to ISO format
-        localized_dt = pytz.timezone('Asia/Kolkata').localize(dt_obj)
-        return localized_dt.isoformat()
+        result = datetime.combine(target_date, time(hour, minute))
+        return tz.localize(result).isoformat()
 
     except Exception as e:
-        print(f"Error parsing flexible datetime '{date_str}': {e}")
-        # Fallback to current time if parsing fails
-        return datetime.now(pytz.timezone('Asia/Kolkata')).isoformat()
+        logger.exception("datetime parsing failed", extra={"date_input": date_str})
+        # Return current time as fallback
+        return datetime.now(tz).isoformat()
 
 # --- Context Management ---
 class ContextManager:
@@ -551,7 +567,7 @@ def get_structured_response(llm: CachedLLM, messages: List[Dict], response_model
         return structured_response
 
     except (json.JSONDecodeError, ValidationError) as e:
-        print(f"Structured output parsing error: {e}. Raw content: {content}")
+        logger.warning("structured LLM output parsing failed", extra={"raw_llm_output": content})
         context_manager.update_context_stack(state, 'error', {
             'type': 'parsing_error',
             'error': str(e),
@@ -575,7 +591,7 @@ def get_structured_response(llm: CachedLLM, messages: List[Dict], response_model
                 context_preserved=True
             )
     except Exception as e:
-        print(f"An unexpected error occurred in get_structured_response: {e}")
+        logger.exception("structured response generation failed")
         context_manager.update_context_stack(state, 'error', {
             'type': 'unexpected_error_structured_response',
             'error': str(e),
@@ -597,109 +613,19 @@ def get_structured_response(llm: CachedLLM, messages: List[Dict], response_model
                 context_preserved=False
             )
 
-# --- Voice I/O Helpers ---
-def _play_audio_platform_agnostic(audio_file_path: str) -> None:
-    """Plays an audio file using platform-specific commands."""
-    if not os.path.exists(audio_file_path):
-        print(f"Error: Audio file not found at {audio_file_path}")
-        return
-
-    try:
-        # Using pydub.playback.play for cross-platform compatibility
-        # Requires ffplay/ffmpeg or other backend installed and in PATH
-        audio = AudioSegment.from_file(audio_file_path)
-        play(audio)
-    except Exception as e:
-        print(f"Error playing audio with pydub: {e}")
-        print("Attempting fallback to system commands...")
-        if os.name == 'nt':  # Windows
-            os.system(f'start /min wmplayer "{audio_file_path}"')
-        else:  # Unix-like systems (Linux, macOS)
-            result = os.system(f'mpg123 "{audio_file_path}" 2>/dev/null')
-            if result != 0:
-                if os.system('which afplay >/dev/null 2>&1') == 0:
-                    os.system(f'afplay "{audio_file_path}"')
-                else:
-                    os.system(f'ffplay -nodisp -autoexit "{audio_file_path}" 2>/dev/null')
-    except Exception as e:
-        print(f"Error playing audio: {e}")
-
 # --- Node Functions ---
 def detect_mode(state: AgentState) -> AgentState:
-    """Determines if the input is voice or text and initializes flow control flags."""
-    print("DEBUG: Entering detect_mode node.")
+    """Initializes flow control flags."""
+    logger.debug("detect_mode")
     state['skip_to_response'] = False
     state['is_general_conversation'] = False
     return state
-
-def voice_detection_node(state: AgentState) -> AgentState:
-    """
-    Handles voice input detection and transcription using SpeechRecognition.
-    Updates the state with transcribed text or an error message.
-    NOTE: This node is primarily for a direct microphone input scenario.
-    For web-based voice input (like in app.py), transcription happens in the endpoint.
-    This node might be simplified or removed if all voice input is pre-transcribed.
-    """
-    if not state.get('is_voice_input', False):
-        print("DEBUG: Not a voice input, skipping voice_detection_node.")
-        return state
-
-    # If user_input is already set (e.g., from app.py's voice endpoint), skip mic input
-    if state.get('user_input') and state['user_input'] != "No speech detected." and \
-       state['user_input'] != "Could not understand audio." and \
-       state['user_input'] != "Speech recognition service error." and \
-       state['user_input'] != "Unexpected voice input error.":
-        print(f"DEBUG: Voice input already transcribed: \"{state['user_input']}\"")
-        return state
-
-    print("🎙️ Voice input detection started (from agent2.py node)...")
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 300
-    recognizer.dynamic_energy_threshold = True
-
-    try:
-        with sr.Microphone() as source:
-            print("🎙️ Adjusting for ambient noise, please wait...")
-            recognizer.adjust_for_ambient_noise(source, duration=1)
-            print("🎙️ Listening for your command...")
-
-            audio = recognizer.listen(source, timeout=10, phrase_time_limit=15)
-            print("🎙️ Processing audio...")
-
-            transcribed_text = recognizer.recognize_google(audio, language='en-US', show_all=False)
-            state['user_input'] = transcribed_text.strip()
-            print(f"Transcribed: \"{state['user_input']}\"")
-
-    except sr.WaitTimeoutError:
-        state['user_input'] = "No speech detected."
-        state['error_message'] = "No speech detected. Please try again."
-        print("ERROR: No speech detected.")
-    except sr.UnknownValueError:
-        state['user_input'] = "Could not understand audio."
-        state['error_message'] = "Sorry, I couldn't understand the audio. Please speak clearly."
-        print("ERROR: Could not understand audio.")
-    except sr.RequestError as e:
-        state['user_input'] = "Speech recognition service error."
-        state['error_message'] = f"Error with speech recognition service: {e}"
-        print(f"ERROR: Speech recognition service error: {e}")
-    except Exception as e:
-        state['user_input'] = "Unexpected voice input error."
-        state['error_message'] = f"Unexpected error during voice detection: {e}"
-        print(f"ERROR: Unexpected voice input error: {e}")
-
-    return state
-
 def intelligent_intent_analysis_node(state: AgentState) -> AgentState:
     """
     Analyzes user intent using an LLM, determines the appropriate tool,
     and extracts necessary arguments. Updates the state with analysis results.
     """
-    print("\n" + "="*50)
-    print("🧠 Analyzing user intent...")
-    print("="*50)
-
     user_input = state['user_input']
-    print(f"\n📝 User Input: \"{user_input}\"")
 
     # Store current collected_info to track changes later
     state['previous_collected_info'] = state.get('collected_info', {}).copy()
@@ -708,11 +634,12 @@ def intelligent_intent_analysis_node(state: AgentState) -> AgentState:
     context = context_manager.build_enhanced_context(state)
     history_context = context.get('conversation', 'No history.')
 
-    print("\n📜 Context Summary:")
-    print(f"- Active Event ID: {state.get('active_event_id', 'None')}")
-    print(f"- Last Tool Used: {state.get('last_successful_tool', 'None')}")
-    print(f"- Conversation History Length: {len(state.get('conversation_history', []))} messages")
-    print(f"- Previously Collected Info: {json.dumps(state.get('collected_info', {}), indent=2)}")
+    logger.debug("intent analysis started", extra={
+        "session_id": state.get("session_id"),
+        "active_event_id": state.get("active_event_id"),
+        "last_successful_tool": state.get("last_successful_tool"),
+        "conversation_history_size": len(state.get("conversation_history", [])),
+    })
 
     prompt = f"""You are Mogambo, an intelligent calendar assistant created by Waseem M Ansari at WSMAISYS lab.
 
@@ -797,218 +724,176 @@ Respond with JSON matching the `IntentAnalysis` structure:
     if analysis.tool in [ToolType.GENERAL_RESPONSE, ToolType.NEED_CLARIFICATION]:
         state['skip_to_response'] = True
 
-    # Print detailed analysis results for debugging
-    print("\n" + "="*50)
-    print("🎯 Intent Analysis Results:")
-    print("="*50)
-    print(f"\n🔍 Detected Intent: {analysis.tool.value}")
-    print(f"📊 Confidence: {analysis.confidence:.2f}")
-    print(f"💭 Reasoning: {analysis.reasoning}")
-
-    if merged_collected:
-        print("\n📝 Collected Information:")
-        print(json.dumps(merged_collected, indent=2))
-
-    if analysis.missing_fields:
-        print("\n❓ Missing Required Fields:")
-        for field in analysis.missing_fields:
-            print(f"- {field}")
-
-    if analysis.clarification_question:
-        print(f"\n❔ Clarification Needed: {analysis.clarification_question}")
-
-    print("\n" + "="*50)
+    logger.info("intent analysis completed", extra={
+        "session_id": state.get("session_id"),
+        "tool": analysis.tool.value,
+        "confidence": analysis.confidence,
+        "missing_fields": analysis.missing_fields,
+        "needs_clarification": state["pending_clarification"],
+    })
 
     return state
 
 # --- Calendar Tool Nodes ---
 def _resolve_event_reference(state: AgentState) -> Optional[str]:
     """
-    Smart event resolution with context awareness and fuzzy matching.
+    Enhanced smart event resolution with improved context awareness and fuzzy matching.
     Returns event_id if found, None if needs clarification or no match.
     Updates state['event_context'] and state['last_event_matches'].
     """
     service = state.get('service')
     if not service:
-        print("ERROR: Calendar service not available for event resolution.")
+        logger.warning("calendar service unavailable for event resolution")
         return None
 
     event_id: Optional[str] = None
     calendar_id = state.get('collected_info', {}).get('calendar_id', 'primary')
     user_input = state['user_input'].lower()
     
-    # 1. Try active event first if user refers to "this event" or it's the last active one
+    logger.debug(f"Resolving event reference from input: {user_input}")
+    
+    # 1. Extract temporal context (today/tomorrow)
+    tz = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(tz)
+    search_date = now
+    
+    if "tomorrow" in user_input:
+        search_date = now + timedelta(days=1)
+        logger.debug(f"Searching for events tomorrow ({search_date.date()})")
+    elif "today" in user_input:
+        logger.debug(f"Searching for events today ({search_date.date()})")
+    
+    # 2. Try active event first if user refers to "this event" or it's the last active one
     if state.get('active_event_id'):
         try:
             event = service.events().get(calendarId=calendar_id, eventId=state['active_event_id']).execute()
             if any(ref in user_input for ref in ['this event', 'that event', 'current event']) or \
-               fuzz.ratio(event.get('summary', '').lower(), user_input) > 70: # High fuzzy match
+               fuzz.ratio(event.get('summary', '').lower(), user_input) > 70:
+                logger.debug(f"Found matching active event: {event.get('summary')}")
                 state['event_context'] = event
                 return state['active_event_id']
-        except Exception:
-            print(f"DEBUG: Active event ID {state['active_event_id']} is invalid or not found. Clearing.")
-            state['active_event_id'] = '' # Clear invalid active event
-
-    # 2. Try to resolve from user input with temporal/numeric references
-    temporal_numeric_refs = {
-        'last': -1, 'previous': -1, 'next': 0, 'upcoming': 0, # 'next' and 'upcoming' usually refer to the first in a list
-        'first': 0, 'second': 1, 'third': 2, '1st': 0, '2nd': 1, '3rd': 2
-    }
-    
-    if state.get('last_event_matches'):
-        for ref, index in temporal_numeric_refs.items():
-            if ref in user_input:
-                try:
-                    # Handle "next" and "upcoming" to refer to the first event in the list
-                    if ref in ['next', 'upcoming'] and len(state['last_event_matches']) > 0:
-                        state['event_context'] = state['last_event_matches'][0]
-                        return state['last_event_matches'][0]['id']
-                    elif 0 <= index < len(state['last_event_matches']):
-                        state['event_context'] = state['last_event_matches'][index]
-                        return state['last_event_matches'][index]['id']
-                except IndexError:
-                    print(f"DEBUG: Index {index} out of bounds for last_event_matches.")
-                    pass
-    
-    # 3. Try fuzzy matching with recent events from conversation history
-    recent_matches_from_history: List[Dict[str, Any]] = []
-    for msg in reversed(state.get('conversation_history', [])):
-        if msg.get('role') == 'assistant' and 'event' in msg.get('content', '').lower():
-            ids = re.findall(r'ID: ([a-zA-Z0-9_-]+)', msg.get('content', ''))
-            for eid in ids:
-                try:
-                    event = service.events().get(calendarId=calendar_id, eventId=eid).execute()
-                    recent_matches_from_history.append({
-                        'id': eid,
-                        'summary': event.get('summary', ''),
-                        'start': event['start'].get('dateTime', event['start'].get('date')),
-                        'source': 'history'
-                    })
-                except Exception:
-                    continue
-    
-    combined_recent_matches = list(state.get('last_event_matches', [])) + recent_matches_from_history
-    
-    if combined_recent_matches:
-        best_match_id = None
-        best_score = 0.0
-        for event in combined_recent_matches:
-            event_summary = event.get('summary', '').lower()
-            summary_score = fuzz.ratio(user_input, event_summary)
-            
-            # Temporal relevance boost
-            time_relevance_boost = 1.0
-            if 'start' in event:
-                try:
-                    start_val = event['start']
-                    if isinstance(start_val, dict):
-                        start_str = start_val.get('dateTime') or start_val.get('date')
-                    else:
-                        start_str = start_val
-                    if isinstance(start_str, str):
-                        event_time = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
-                        if event_time.tzinfo is None:
-                            event_time = event_time.replace(tzinfo=pytz.UTC)
-                        else:
-                            event_time = event_time.astimezone(pytz.UTC)
-                        now_utc = datetime.now(pytz.UTC)
-                        time_diff_hours = abs((event_time - now_utc).total_seconds() / 3600)
-                        if time_diff_hours < 24: time_relevance_boost = 1.2
-                        elif time_diff_hours < 168: time_relevance_boost = 1.1
-                except (ValueError, TypeError, AttributeError): pass
-            
-            # Source boost (history matches are often more relevant)
-            source_boost = 1.2 if event.get('source') == 'history' else 1.0
-            
-            final_score = summary_score * time_relevance_boost * source_boost
-            
-            if final_score > best_score and final_score > 75: # High confidence threshold
-                best_score = final_score
-                best_match_id = event['id']
-        
-        if best_match_id:
-            try:
-                event = service.events().get(calendarId=calendar_id, eventId=best_match_id).execute()
-                state['event_context'] = event
-                return best_match_id
-            except Exception:
-                print(f"DEBUG: Best fuzzy match event ID {best_match_id} not found or invalid.")
-                pass
-
-    # 4. Search by extended context (summary, date, description from collected_info)
-    # This helper function needs to be defined or mocked if not already present
-    def find_events_by_context(service_obj, cal_id, context_data):
-        """
-        Searches for events in the calendar matching the provided context_data (summary, time_min, time_max).
-        Returns a list of matching events.
-        """
-        print(f"DEBUG: Searching events by context: {context_data}")
-        summary = context_data.get('summary', '').lower()
-        time_min = context_data.get('time_min')
-        time_max = context_data.get('time_max')
-        try:
-            events_result = service_obj.events().list(
-                calendarId=cal_id,
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                orderBy='startTime'
-            ).execute()
-            events = events_result.get('items', [])
-            matches = []
-            for event in events:
-                event_summary = event.get('summary', '').lower()
-                if summary and summary in event_summary:
-                    matches.append({
-                        'id': event.get('id'),
-                        'summary': event.get('summary', ''),
-                        'start': event.get('start', {})
-                    })
-            print(f"DEBUG: Found {len(matches)} matching events.")
-            return matches
         except Exception as e:
-            print(f"ERROR: Failed to search events by context: {e}")
-            return []
+            logger.debug("active event id invalid", extra={"active_event_id": state.get("active_event_id")})
+            state['active_event_id'] = ''
 
-    context_info = state.get('collected_info', {})
-    if context_info.get('summary') or context_info.get('date'):
-        search_matches = find_events_by_context(service, calendar_id, context_info)
-        if search_matches:
-            state['last_event_matches'] = search_matches # Store all matches
-            if len(search_matches) == 1:
-                state['event_context'] = search_matches[0]
-                return search_matches[0]['id']
+    # 3. Extract any person/summary references
+    # Common name patterns in event titles
+    name_pattern = r'(?:meeting|call|sync|chat|catch up|appointment)\s+(?:with|for)?\s+(\w+)'
+    name_match = re.search(name_pattern, user_input, re.IGNORECASE)
+    person_name = name_match.group(1) if name_match else None
+    
+    if person_name:
+        logger.debug(f"Looking for events with person: {person_name}")
+        # Search for events on the target date matching the person's name
+        matches = find_events_by_summary_and_date(service, calendar_id, person_name, search_date.date().isoformat())
+        if matches:
+            if len(matches) == 1:
+                state['event_context'] = matches[0]
+                logger.debug(f"Found single matching event with {person_name}")
+                return matches[0]['id']
             else:
-                # Multiple matches, need clarification
+                state['last_event_matches'] = matches
                 clarification_details = []
-                for i, match in enumerate(search_matches[:3], 1): # Show top 3
-                    start_time = match.get('start', 'unknown time')
-                    summary = match.get('summary', 'Untitled event')
-                    clarification_details.append(f"{i}. '{summary}' at {start_time}")
+                for i, match in enumerate(matches[:3], 1):
+                    start = match['start'].get('dateTime', match['start'].get('date'))
+                    if isinstance(start, str):
+                        start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                        formatted_time = start_dt.astimezone(tz).strftime('%I:%M %p')
+                    else:
+                        formatted_time = "all day"
+                    clarification_details.append(f"{i}. '{match.get('summary')}' at {formatted_time}")
                 
                 state['clarification_context'] = {
                     'type': 'event_selection',
-                    'reason': 'Multiple matching events found',
-                    'matches': search_matches,
+                    'reason': f"Found multiple events with {person_name}",
+                    'matches': matches,
                     'details': clarification_details,
-                    'suggestion': "Please specify which event you mean by its number or more details."
+                    'suggestion': "Please specify which event you mean by its number or provide more details."
                 }
-                print(f"DEBUG: Multiple events found, requiring clarification: {clarification_details}")
-                return None # Indicate need for clarification
+                logger.debug(f"Multiple matches found: {clarification_details}")
+                return None
+
+    # 4. Try numeric references if we have last_event_matches
+    if state.get('last_event_matches'):
+        numeric_refs = {
+            'first': 0, 'second': 1, 'third': 2,
+            '1st': 0, '2nd': 1, '3rd': 2,
+            'last': -1
+        }
+        for ref, index in numeric_refs.items():
+            if ref in user_input:
+                try:
+                    events = state['last_event_matches']
+                    if 0 <= index < len(events) or (index == -1 and events):
+                        idx = index if index >= 0 else len(events) + index
+                        event = events[idx]
+                        state['event_context'] = event
+                        logger.debug(f"Found event by numeric reference: {event.get('summary')}")
+                        return event['id']
+                except IndexError:
+                    logger.debug(f"Invalid index {index} for event matches")
+                    continue
+
+    # 5. Fallback to contextual search
+    try:
+        # Get events for the target date
+        start_time = search_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_time = start_time + timedelta(days=1)
+        
+        events_result = service.events().list(
+            calendarId=calendar_id,
+            timeMin=start_time.isoformat(),
+            timeMax=end_time.isoformat(),
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        events = events_result.get('items', [])
+        if events:
+            best_match = None
+            best_score = 0
+            
+            for event in events:
+                summary = event.get('summary', '').lower()
+                description = event.get('description', '').lower()
+                combined_text = f"{summary} {description}"
+                
+                # Calculate match score based on multiple factors
+                summary_score = fuzz.ratio(user_input, summary)
+                combined_score = fuzz.ratio(user_input, combined_text)
+                
+                final_score = max(summary_score, combined_score * 0.8)  # Prefer summary matches
+                
+                if final_score > best_score and final_score > 70:
+                    best_score = final_score
+                    best_match = event
+            
+            if best_match:
+                state['event_context'] = best_match
+                logger.debug(f"Found best matching event: {best_match.get('summary')} (score: {best_score})")
+                return best_match['id']
+    
+    except Exception as e:
+        logger.exception("contextual event search failed")
 
     # No event found
     state['clarification_context'] = {
         'type': 'no_matches',
-        'reason': 'No matching events found based on current context.',
-        'searched_context': context_info,
-        'suggestion': "Try providing more specific details about the event you're looking for (e.g., exact title, date)."
+        'reason': 'No matching events found.',
+        'searched_context': {
+            'date': search_date.date().isoformat(),
+            'person': person_name,
+            'input': user_input
+        },
+        'suggestion': "Could you provide more details about the event you're looking for?"
     }
-    print("DEBUG: No event reference resolved.")
+    logger.debug("No event reference resolved")
     return None
 
 def create_calendar_event_node(state: AgentState) -> AgentState:
     """Creates a new calendar event using collected information."""
-    print("📅 Entering create_calendar_event_node...")
+    logger.debug("📅 Entering create_calendar_event_node...")
+    
     service = state.get('service')
     if not service:
         state['tool_output'] = "Calendar service is not available. Please ensure you are logged in."
@@ -1051,22 +936,22 @@ def create_calendar_event_node(state: AgentState) -> AgentState:
                 f"⏰ End: {end_time_iso}\n"
                 f"🔗 Event ID: {event_id}"
             )
-            print(f"DEBUG: Event created: {state['tool_output']}")
+            logger.debug(f"Event created: {state['tool_output']}")
         else:
             state['tool_output'] = "Failed to retrieve event ID after creation."
             state['error_message'] = "Event creation successful but ID not returned."
-            print("ERROR: Event created but ID not returned.")
+            logger.warning("calendar event created without returned id")
 
     except Exception as e:
         state['error_message'] = f"Failed to create event: {str(e)}"
         state['tool_output'] = f"❌ Failed to create event: {str(e)}"
-        print(f"ERROR: Event creation failed: {e}")
+        logger.exception("calendar event creation failed")
 
     return state
 
 def retrieve_calendar_events_node(state: AgentState) -> AgentState:
     """Retrieves calendar events based on time range and other filters."""
-    print("📋 Entering retrieve_calendar_events_node...")
+    logger.debug("📋 Entering retrieve_calendar_events_node...")
     service = state.get('service')
     if not service:
         state['tool_output'] = "Calendar service is not available. Please ensure you are logged in."
@@ -1096,7 +981,7 @@ def retrieve_calendar_events_node(state: AgentState) -> AgentState:
 
         if cached_events:
             events = cached_events
-            print("DEBUG: Using cached events for retrieval.")
+            logger.debug("Using cached events for retrieval.")
         else:
             events_result = service.events().list(
                 calendarId=calendar_id,
@@ -1107,7 +992,7 @@ def retrieve_calendar_events_node(state: AgentState) -> AgentState:
             ).execute()
             events = events_result.get('items', [])
             GlobalCache.instance().set(cache_key, events)
-            print("DEBUG: Fetched events from calendar API.")
+            logger.debug("Fetched events from calendar API.")
 
         if not events:
             state['tool_output'] = f"I've checked your calendar and it appears to be clear between {time_min_dt.strftime('%I:%M %p on %b %d')} and {time_max_dt.strftime('%I:%M %p on %b %d')}. You have no scheduled events during this time period."
@@ -1129,7 +1014,7 @@ def retrieve_calendar_events_node(state: AgentState) -> AgentState:
             if len(events) == 1:
                 state['active_event_id'] = events[0].get('id', '')
                 state['event_context'] = events[0]
-                print(f"DEBUG: Set active event ID: {state['active_event_id']}")
+                logger.debug(f"Set active event ID: {state['active_event_id']}")
 
             state['last_event_matches'] = events # Store for potential future reference
             state['last_successful_tool'] = ToolType.RETRIEVE_EVENTS.value
@@ -1138,18 +1023,18 @@ def retrieve_calendar_events_node(state: AgentState) -> AgentState:
                 "\n".join(event_list_str) +
                 f"\n\nTotal: {len(events)} event{'s' if len(events) != 1 else ''}."
             )
-            print(f"DEBUG: Successfully processed {len(events)} events.")
+            logger.debug(f"Successfully processed {len(events)} events.")
 
     except Exception as e:
         state['error_message'] = f"Failed to retrieve events: {str(e)}"
         state['tool_output'] = f"❌ Failed to retrieve events: {str(e)}"
-        print(f"ERROR: Event retrieval failed: {e}")
+        logger.exception("calendar event retrieval failed")
 
     return state
 
 def update_calendar_event_node(state: AgentState) -> AgentState:
     """Updates an existing calendar event."""
-    print("✏️ Entering update_calendar_event_node...")
+    logger.debug("✏️ Entering update_calendar_event_node...")
     service = state.get('service')
     if not service:
         state['tool_output'] = "Calendar service is not available. Please ensure you are logged in."
@@ -1203,21 +1088,21 @@ def update_calendar_event_node(state: AgentState) -> AgentState:
                 f"🔗 Event ID: {event_id}\n"
                 f"Updated: {', '.join(updates_made)}"
             )
-            print(f"DEBUG: Event updated: {state['tool_output']}")
+            logger.debug(f"Event updated: {state['tool_output']}")
         else:
             state['tool_output'] = "No changes detected to update the event. Please specify what you'd like to change."
-            print("DEBUG: No changes requested for event update.")
+            logger.debug("No changes requested for event update.")
 
     except Exception as e:
         state['error_message'] = f"Failed to update event: {str(e)}"
         state['tool_output'] = f"❌ Failed to update event: {str(e)}"
-        print(f"ERROR: Event update failed: {e}")
+        logger.exception("calendar event update failed")
 
     return state
 
 def delete_calendar_event_node(state: AgentState) -> AgentState:
     """Deletes a calendar event."""
-    print("🗑️ Entering delete_calendar_event_node...")
+    logger.debug("🗑️ Entering delete_calendar_event_node...")
     service = state.get('service')
     if not service:
         state['tool_output'] = "Calendar service is not available. Please ensure you are logged in."
@@ -1225,7 +1110,7 @@ def delete_calendar_event_node(state: AgentState) -> AgentState:
         return state
 
     args = state['collected_info']
-    print(f"DEBUG: delete_calendar_event_node args type: {type(args)}, value: {args}")
+    logger.debug(f"delete_calendar_event_node args type: {type(args)}, value: {args}")
     if not isinstance(args, dict):
         try:
             args = dict(args)
@@ -1259,18 +1144,18 @@ def delete_calendar_event_node(state: AgentState) -> AgentState:
             f"scheduled for {event_start_time}.\n"
             f"🔗 Event ID: {event_id}"
         )
-        print(f"DEBUG: Event deleted: {state['tool_output']}")
+        logger.debug(f"Event deleted: {state['tool_output']}")
 
     except Exception as e:
         state['error_message'] = f"Failed to delete event: {str(e)}"
         state['tool_output'] = f"❌ Failed to delete event: {str(e)}"
-        print(f"ERROR: Event deletion failed: {e}")
+        logger.exception("calendar event deletion failed")
 
     return state
 
 def find_freebusy_node(state: AgentState) -> AgentState:
     """Checks calendar availability for a given time range."""
-    print("🔍 Entering find_freebusy_node...")
+    logger.debug("🔍 Entering find_freebusy_node...")
     service = state.get('service')
     if not service:
         state['tool_output'] = "Calendar service is not available. Please ensure you are logged in."
@@ -1310,12 +1195,12 @@ def find_freebusy_node(state: AgentState) -> AgentState:
                 "\n".join(busy_list)
             )
         state['last_successful_tool'] = ToolType.FIND_FREEBUSY.value
-        print(f"DEBUG: Free/busy check result: {state['tool_output']}")
+        logger.debug(f"Free/busy check result: {state['tool_output']}")
 
     except Exception as e:
         state['error_message'] = f"Failed to check availability: {str(e)}"
         state['tool_output'] = f"❌ Failed to check availability: {str(e)}"
-        print(f"ERROR: Free/busy check failed: {e}")
+        logger.exception("calendar freebusy check failed")
 
     return state
 
@@ -1324,10 +1209,6 @@ def generate_intelligent_response_node(state: AgentState) -> AgentState:
     Generates the final conversational response to the user,
     incorporating tool outputs, errors, and context.
     """
-    print("\n" + "="*50)
-    print("🗣️ Generating intelligent response...")
-    print("="*50)
-
     user_input = state['user_input']
     tool_output = state.get('tool_output', '')
     error_msg = state.get('error_message', '')
@@ -1340,7 +1221,7 @@ def generate_intelligent_response_node(state: AgentState) -> AgentState:
     cached_response = GlobalCache.instance().get(cache_key)
     if cached_response and not error_msg:
         state['final_response_text'] = cached_response
-        print("DEBUG: Using cached response.")
+        logger.debug("response cache hit", extra={"session_id": state.get("session_id")})
         return state
 
     context = context_manager.build_enhanced_context(state)
@@ -1408,54 +1289,12 @@ Ensure your response is helpful and guides the user.
     state['final_response_text'] = final_response
     GlobalCache.instance().set(cache_key, final_response) # Cache the generated response
 
-    print("\n" + "="*50)
-    print("🗣️ Final Generated Response:")
-    print("="*50)
-    print(final_response)
-    print("="*50)
-
-    return state
-
-def text_to_speech_node(state: AgentState) -> AgentState:
-    """
-    Converts the final response text to speech using gTTS and plays the audio.
-    Handles cleanup and platform-specific playback.
-    """
-    audio_file = "response_tts.mp3"
-    try:
-        text = state.get('final_response_text', '').strip()
-        if not text:
-            state['error_message'] = "No text to convert to speech."
-            print("ERROR: No text for TTS conversion.")
-            return state
-
-        # Clean up existing audio file if it exists
-        if os.path.exists(audio_file):
-            try:
-                os.remove(audio_file)
-                print(f"DEBUG: Removed old audio file: {audio_file}")
-            except OSError as e:
-                print(f"WARNING: Could not remove old audio file {audio_file}: {e}")
-
-        tts = gTTS(text=text, lang='en', slow=False)
-        tts.save(audio_file)
-
-        if os.path.exists(audio_file):
-            _play_audio_platform_agnostic(audio_file)
-            state['audio_file'] = audio_file
-            print(f"DEBUG: Audio saved and played: {audio_file}")
-        else:
-            state['error_message'] = "Failed to create audio file for TTS."
-            print("ERROR: Failed to create audio file for TTS.")
-
-    except Exception as e:
-        state['error_message'] = f"TTS error: {str(e)}"
-        print(f"ERROR: TTS processing error: {e}")
-        if os.path.exists(audio_file):
-            try:
-                os.remove(audio_file)
-            except OSError:
-                pass # Ignore if cleanup fails again
+    logger.info("response generated", extra={
+        "session_id": state.get("session_id"),
+        "intended_tool": state.get("intended_tool"),
+        "has_error": bool(error_msg),
+        "needs_clarification": pending_clarification,
+    })
 
     return state
 
@@ -1554,7 +1393,6 @@ def create_intelligent_workflow() -> StateGraph:
 
     # Add nodes to the graph
     graph.add_node('detect_mode', detect_mode)
-    graph.add_node('voice_input', voice_detection_node)
     graph.add_node('intent_analysis', intelligent_intent_analysis_node)
     graph.add_node('create_event', create_calendar_event_node)
     graph.add_node('retrieve_events', retrieve_calendar_events_node)
@@ -1562,20 +1400,10 @@ def create_intelligent_workflow() -> StateGraph:
     graph.add_node('delete_event', delete_calendar_event_node)
     graph.add_node('find_freebusy', find_freebusy_node)
     graph.add_node('generate_response', generate_intelligent_response_node)
-    graph.add_node('text_to_speech', text_to_speech_node)
 
     # Define graph entry point
     graph.add_edge(START, 'detect_mode')
-
-    # Conditional routing based on input mode (voice or text)
-    graph.add_conditional_edges(
-        'detect_mode',
-        lambda state: 'voice_input' if state.get('is_voice_input') else 'intent_analysis',
-        {'voice_input': 'voice_input', 'intent_analysis': 'intent_analysis'}
-    )
-
-    # After voice input, proceed to intent analysis
-    graph.add_edge('voice_input', 'intent_analysis')
+    graph.add_edge('detect_mode', 'intent_analysis')
 
     # Conditional routing after intent analysis to specific tool nodes or response generation
     def route_after_intent(state: AgentState) -> str:
@@ -1611,15 +1439,7 @@ def create_intelligent_workflow() -> StateGraph:
     for tool_node in ['create_event', 'retrieve_events', 'update_event', 'delete_event', 'find_freebusy']:
         graph.add_edge(tool_node, 'generate_response')
 
-    # Final routing from response generation to text-to-speech or END
-    graph.add_conditional_edges(
-        'generate_response',
-        lambda state: 'text_to_speech' if state.get('is_voice_input') else END,
-        {'text_to_speech': 'text_to_speech', END: END}
-    )
-
-    # Text-to-speech node always leads to END
-    graph.add_edge('text_to_speech', END)
+    graph.add_edge('generate_response', END)
 
     return graph.compile()
 
@@ -1664,7 +1484,6 @@ def create_initial_state(
             'event_context': previous_state.get('event_context', {}),
             'clarification_context': previous_state.get('clarification_context', {}),
             'user_preferences': previous_state.get('user_preferences', {}),
-            'audio_file': "",
             'previous_collected_info': previous_state.get('collected_info', {}) # Snapshot for change tracking
         }
     else:
@@ -1693,7 +1512,6 @@ def create_initial_state(
             'event_context': {},
             'clarification_context': {},
             'user_preferences': {},
-            'audio_file': "",
             'previous_collected_info': {}
         }
 
@@ -1710,150 +1528,3 @@ def create_initial_state(
         })
 
     return state
-
-# # Example of how to run the workflow (for demonstration, not part of the refactored agent.py)
-# if __name__ == "__main__":
-#     # This block demonstrates how the refactored code would be used.
-#     # In a real application, 'service' would be an authenticated Google Calendar API client.
-#     # For testing, you might mock it or provide a dummy object.
-
-#     class MockCalendarService:
-#         """A mock Google Calendar service for testing purposes."""
-#         def events(self):
-#             class MockEvents:
-#                 def list(self, **kwargs):
-#                     print(f"MockCalendarService: Listing events with {kwargs}")
-#                     # Return a dummy event list for testing retrieve_calendar_events_node
-#                     if "timeMin" in kwargs and "timeMax" in kwargs:
-#                         return type('obj', (object,), {'execute': lambda: {
-#                             'items': [
-#                                 {
-#                                     'id': 'mock_event_1',
-#                                     'summary': 'Mock Event Today',
-#                                     'start': {'dateTime': '2023-11-20T09:00:00+05:30'},
-#                                     'end': {'dateTime': '2023-11-20T10:00:00+05:30'}
-#                                 },
-#                                 {
-#                                     'id': 'mock_event_2',
-#                                     'summary': 'Another Mock Event',
-#                                     'start': {'dateTime': '2023-11-20T14:00:00+05:30'},
-#                                     'end': {'dateTime': '2023-11-20T15:00:00+05:30'}
-#                                 }
-#                             ]
-#                         }})()
-#                     return self
-
-#                 def get(self, **kwargs):
-#                     print(f"MockCalendarService: Getting event with {kwargs}")
-#                     # Return a dummy event for testing _resolve_event_reference and update/delete
-#                     event_id = kwargs.get('eventId')
-#                     if event_id == 'dummy_event_id_123':
-#                         return type('obj', (object,), {'execute': lambda: {
-#                             'id': 'dummy_event_id_123',
-#                             'summary': 'Project Sync',
-#                             'start': {'dateTime': '2023-11-21T10:00:00+05:30'},
-#                             'end': {'dateTime': '2023-11-21T11:00:00+05:30'}
-#                         }})()
-#                     elif event_id == 'new_event_id_456':
-#                          return type('obj', (object,), {'execute': lambda: {
-#                             'id': 'new_event_id_456',
-#                             'summary': 'New Meeting',
-#                             'start': {'dateTime': '2023-11-22T09:00:00+05:30'},
-#                             'end': {'dateTime': '2023-11-22T10:00:00+05:30'}
-#                         }})()
-#                     elif event_id == 'mock_event_1':
-#                          return type('obj', (object,), {'execute': lambda: {
-#                             'id': 'mock_event_1',
-#                             'summary': 'Mock Event Today',
-#                             'start': {'dateTime': '2023-11-20T09:00:00+05:30'},
-#                             'end': {'dateTime': '2023-11-20T10:00:00+05:30'}
-#                         }})()
-#                     return type('obj', (object,), {'execute': lambda: {}})() # Default empty event
-
-#                 def insert(self, **kwargs):
-#                     print(f"MockCalendarService: Inserting event with {kwargs}")
-#                     return type('obj', (object,), {'execute': lambda: {'id': 'new_event_id_456', 'summary': kwargs['body']['summary']}})()
-
-#                 def update(self, **kwargs):
-#                     print(f"MockCalendarService: Updating event with {kwargs}")
-#                     # Simulate updating the summary and time
-#                     updated_summary = kwargs['body'].get('summary', 'Updated Event')
-#                     updated_start = kwargs['body'].get('start', {}).get('dateTime', 'N/A')
-#                     return type('obj', (object,), {'execute': lambda: {'id': kwargs['eventId'], 'summary': updated_summary, 'start': {'dateTime': updated_start}}})()
-
-#                 def delete(self, **kwargs):
-#                     print(f"MockCalendarService: Deleting event with {kwargs}")
-#                     return type('obj', (object,), {'execute': lambda: None})()
-
-#                 def query(self, **kwargs):
-#                     print(f"MockCalendarService: Querying freebusy with {kwargs}")
-#                     # Always return free for mock
-#                     return type('obj', (object,), {'execute': lambda: {'calendars': {'primary': {'busy': []}}}})()
-#             return MockEvents()
-#         def freebusy(self):
-#             return self.events() # freebusy is also under events in this mock
-
-#     mock_service = MockCalendarService()
-#     session_id = "test_session_123"
-#     current_state: Optional[AgentState] = None
-
-#     print("\n--- Test Scenario 1: Create Event ---")
-#     user_input_1 = "Create a meeting called 'Project Sync' tomorrow at 10 AM for 1 hour."
-#     current_state = create_initial_state(user_input_1, session_id=session_id, service=mock_service)
-#     final_state = workflow.invoke(current_state)
-#     print(f"\nFinal Response: {final_state.get('final_response_text')}")
-#     print(f"Active Event ID: {final_state.get('active_event_id')}")
-#     print(f"Collected Info: {final_state.get('collected_info')}")
-#     # Store the active event ID for subsequent tests
-#     active_event_id_from_create = final_state.get('active_event_id')
-
-#     print("\n--- Test Scenario 2: Retrieve Events ---")
-#     user_input_2 = "What are my events for today?"
-#     current_state = create_initial_state(user_input_2, session_id=session_id, service=mock_service, previous_state=final_state)
-#     final_state = workflow.invoke(current_state)
-#     print(f"\nFinal Response: {final_state.get('final_response_text')}")
-#     print(f"Collected Info: {final_state.get('collected_info')}")
-
-#     print("\n--- Test Scenario 3: General Conversation ---")
-#     user_input_3 = "Hello Mogambo, how are you?"
-#     current_state = create_initial_state(user_input_3, session_id=session_id, service=mock_service, previous_state=final_state)
-#     final_state = workflow.invoke(current_state)
-#     print(f"\nFinal Response: {final_state.get('final_response_text')}")
-
-#     print("\n--- Test Scenario 4: Update Event (using active event from create) ---")
-#     user_input_4 = "Update that meeting to start at 11 AM instead."
-#     current_state = create_initial_state(user_input_4, session_id=session_id, service=mock_service, previous_state=final_state)
-#     # Ensure the active_event_id is correctly passed for the update
-#     current_state['active_event_id'] = active_event_id_from_create if active_event_id_from_create else 'dummy_event_id_123'
-#     final_state = workflow.invoke(current_state)
-#     print(f"\nFinal Response: {final_state.get('final_response_text')}")
-#     print(f"Collected Info: {final_state.get('collected_info')}")
-
-#     print("\n--- Test Scenario 5: Voice Input Simulation ---")
-#     user_input_5 = "Simulate voice input for 'What is the weather like?'"
-#     current_state = create_initial_state(user_input_5, session_id=session_id, service=mock_service, is_voice=True, previous_state=final_state)
-#     # In a real scenario, voice_detection_node would transcribe. Here we just simulate the flag.
-#     final_state = workflow.invoke(current_state)
-#     print(f"\nFinal Response (Voice Simulated): {final_state.get('final_response_text')}")
-#     print(f"Audio File Generated: {final_state.get('audio_file')}")
-
-#     print("\n--- Test Scenario 6: Find Free/Busy ---")
-#     user_input_6 = "Am I free tomorrow from 9 AM to 5 PM?"
-#     current_state = create_initial_state(user_input_6, session_id=session_id, service=mock_service, previous_state=final_state)
-#     final_state = workflow.invoke(current_state)
-#     print(f"\nFinal Response: {final_state.get('final_response_text')}")
-#     print(f"Collected Info: {final_state.get('collected_info')}")
-
-#     print("\n--- Test Scenario 7: Delete Event (using a specific ID) ---")
-#     user_input_7 = "Delete the event with ID mock_event_1."
-#     current_state = create_initial_state(user_input_7, session_id=session_id, service=mock_service, previous_state=final_state)
-#     final_state = workflow.invoke(current_state)
-#     print(f"\nFinal Response: {final_state.get('final_response_text')}")
-#     print(f"Collected Info: {final_state.get('collected_info')}")
-
-#     # Clean up generated audio file if it exists
-#     if os.path.exists("response_tts.mp3"):
-#         os.remove("response_tts.mp3")
-#         print("Cleaned up response_tts.mp3")
-#     print("\n--- All test scenarios completed. ---")
-# # Note: The above test scenarios are for demonstration purposes and would typically be run in a testing

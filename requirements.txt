@@ -5,6 +5,7 @@ jinja2==3.1.2
 python-multipart==0.0.6
 aiofiles==23.2.1
 starlette==0.27.0
+sse-starlette==1.6.5
 
 # Google APIs
 google-auth==2.23.4
@@ -19,10 +20,7 @@ langchain-mistralai==0.1.10
 
 # Audio
 SpeechRecognition==3.10.0
-gTTS==2.4.0
 pydub==0.25.1
-pyaudio==0.2.14
-sounddevice==0.4.6
 
 # Utilities
 python-dotenv==1.0.0

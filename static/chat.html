@@ -221,7 +221,7 @@
         <div id="chat-container">
             <div id="chat-header">
                 <h4 class="mb-0">Calendar Assistant</h4>
-                <div class="d-flex align-items-center gap-3">
+                <div class="chat-controls d-flex align-items-center gap-3">
                     <span id="connection-status" class="badge bg-success">Connected</span>
                     <div class="form-check form-switch">
                         <input class="form-check-input" type="checkbox" id="voice-toggle">
@@ -292,6 +292,20 @@
             navigator.sendBeacon('/logout');
         });
 
+        // Check session status periodically
+        async function checkSession() {
+            try {
+                const response = await fetch('/api/user');
+                if (!response.ok) {
+                    // Session expired or invalid, redirect to login
+                    window.location.href = '/';
+                }
+            } catch (error) {
+                console.error('Session check failed:', error);
+                window.location.href = '/';
+            }
+        }
+
         // Initialize the page
         document.addEventListener('DOMContentLoaded', async () => {
             // Load user info
@@ -308,6 +322,9 @@
             
             // Check connection status
             checkConnection();
+
+            // Start session checking
+            setInterval(checkSession, 300000); // Check every 5 minutes
         });
 
         // Fetch user info from backend
@@ -415,10 +432,17 @@
                 events.forEach(event => {
                     const eventElement = document.createElement('div');
                     eventElement.className = 'calendar-event';
-                    eventElement.innerHTML = `
-                        <div class="fw-bold">${event.title}</div>
-                        <div class="small text-muted">${formatTime(event.start)} - ${formatTime(event.end)}</div>
-                    `;
+
+                    const titleElement = document.createElement('div');
+                    titleElement.className = 'fw-bold';
+                    titleElement.textContent = event.title || 'Untitled event';
+
+                    const timeElement = document.createElement('div');
+                    timeElement.className = 'small text-muted';
+                    timeElement.textContent = `${formatTime(event.start)} - ${formatTime(event.end)}`;
+
+                    eventElement.appendChild(titleElement);
+                    eventElement.appendChild(timeElement);
                     eventElement.addEventListener('click', () => {
                         let message = `Event: ${event.title}\nStart: ${new Date(event.start).toLocaleString()}`;
                         if (event.end) {
@@ -601,7 +625,15 @@
                 
                 if (data.transcribed_text) {
                     addMessage('user', data.transcribed_text);
-                    await sendChatMessage(data.transcribed_text, true);
+                }
+
+                if (data.response) {
+                    addMessage('assistant', data.response);
+                    calendar.refetchEvents();
+                    loadTodaysEvents();
+                    if (speakResponses) {
+                        speakText(data.response);
+                    }
                 }
                 
                 hideVoiceStatus();
@@ -614,36 +646,79 @@
 
         async function sendChatMessage(message, isVoice = false) {
             try {
-                const response = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        message: message,
-                        is_voice: isVoice
-                    })
+                // Create a new message container for the assistant's response
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message p-3 assistant-message';
+                messageDiv.innerHTML = `
+                    <div class="fw-bold mb-1">Calendar Assistant</div>
+                    <div class="assistant-response"></div>
+                `;
+                chatMessages.appendChild(messageDiv);
+                const responseDiv = messageDiv.querySelector('.assistant-response');
+                
+                // Start SSE connection for streaming
+                const params = new URLSearchParams({
+                    message: message,
+                    is_voice: isVoice
                 });
+                const eventSource = new EventSource(`/api/chat/stream?${params.toString()}`);
                 
-                if (!response.ok) {
-                    throw new Error('Chat API request failed');
-                }
+                let fullResponse = '';
                 
-                const data = await response.json();
+                eventSource.onmessage = (event) => {
+                    const chunk = event.data;
+                    fullResponse += chunk + ' ';
+                    responseDiv.textContent = fullResponse;
+                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                };
                 
-                if (data.response) {
-                    addMessage('assistant', data.response);
+                eventSource.addEventListener('done', () => {
+                    eventSource.close();
                     calendar.refetchEvents();
                     loadTodaysEvents();
-                }
+                    
+                    // Start text-to-speech if enabled
+                    if (speakResponses && fullResponse) {
+                        speakText(fullResponse);
+                    }
+                });
                 
-                return data;
+                eventSource.onerror = (error) => {
+                    console.error('SSE Error:', error);
+                    eventSource.close();
+                    responseDiv.textContent = 'Sorry, I encountered an error. Please try again.';
+                };
+                
+                return { success: true };
             } catch (error) {
                 console.error('Chat processing error:', error);
                 addMessage('assistant', 'Sorry, I encountered an error. Please try again.');
                 return null;
             }
         }
+        
+        // Text-to-speech function using Web Speech API
+        function speakText(text) {
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'en-US';
+            utterance.rate = 1.0;
+            utterance.pitch = 1.0;
+            window.speechSynthesis.speak(utterance);
+        }
+        
+        // Add speech toggle
+        let speakResponses = false;
+        const speechToggle = document.createElement('div');
+        speechToggle.className = 'form-check form-switch ms-3';
+        speechToggle.innerHTML = `
+            <input class="form-check-input" type="checkbox" id="speech-toggle">
+            <label class="form-check-label" for="speech-toggle">Enable Speech</label>
+        `;
+        document.querySelector('.chat-controls').appendChild(speechToggle);
+        
+        document.getElementById('speech-toggle').addEventListener('change', (e) => {
+            speakResponses = e.target.checked;
+        });
 
         // Send message to assistant
         async function sendMessage() {
@@ -662,11 +737,18 @@
         function addMessage(sender, text) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message p-3 ${sender}-message`;
-            
-            messageDiv.innerHTML = `
-                <div class="fw-bold mb-1">${sender === 'user' ? (currentUser ? currentUser.name || 'You' : 'You') : 'Calendar Assistant'}</div>
-                <div>${text}</div>
-            `;
+
+            const senderDiv = document.createElement('div');
+            senderDiv.className = 'fw-bold mb-1';
+            senderDiv.textContent = sender === 'user'
+                ? (currentUser ? currentUser.name || 'You' : 'You')
+                : 'Calendar Assistant';
+
+            const textDiv = document.createElement('div');
+            textDiv.textContent = text;
+
+            messageDiv.appendChild(senderDiv);
+            messageDiv.appendChild(textDiv);
             
             chatMessages.appendChild(messageDiv);
             chatMessages.scrollTop = chatMessages.scrollHeight;

@@ -1,9 +1,9 @@
 # ✅ Use Python 3.10 to allow langchain-core + pydantic v1
 FROM python:3.10-slim
 
-# System dependencies for audio
+# System dependencies for browser audio conversion
 RUN apt-get update && apt-get install -y \
-    portaudio19-dev ffmpeg build-essential && \
+    ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # Set working directory
